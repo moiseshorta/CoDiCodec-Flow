@@ -82,55 +82,13 @@ python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --out ./o
 
 ### TUI (Terminal User Interface)
 
-The `--tui` flag enables a Terminal User Interface that displays training metrics in real-time, eliminating the need to monitor log files with `tail -f`.
+Add `--tui` to any training command to enable real-time monitoring with a progress bar and metrics display.
 
-**TUI Features:**
-- **Real-time progress bar** with unicode gradient characters (▏▎▍▌▋▊▉█) showing training progress percentage
-- **Live metrics display** including step count, loss, learning rate, training speed, and estimated time remaining (ETA)
-- **Phase detection** automatically identifies different training phases:
-  - ◐ **Initializing**: Model loading and data preparation
-  - ◐ **Audio generation**: Generating sample audio before training begins
-  - **Progress bar**: Active training with full metrics
-- **Animated loading indicators** (◐, ◑, ◒, ◔) for non-training phases
-
-**TUI Display Example:**
-```
-[██▊                                     ]   6.9% | Step:   686056/10000000 | Loss: 0.7959 | LR: 9.94e-05 | Speed: 2.04 steps/s | ETA: 1268:14:18
-```
-
-**Using TUI for Training:**
 ```bash
-python cli.py train \
-    --data-dir ./data/latents \
-    --out-dir ./runs/v0 \
-    --device mps \
-    --batch-size 4 \
-    --grad-accum 2 \
-    --crop-tokens 512 \
-    --max-steps 10000000 \
-    --warmup-steps 202000 \
-    --lr 1e-4 \
-    --num-workers 0 \
-    --log-every 100 \
-    --val-every 2000 \
-    --ckpt-every 2000 \
-    --audio-sample-every 2000 \
-    --audio-n-samples 2 \
-    --audio-prompt-seconds 4 \
-    --audio-continuation-seconds 8 \
-    --audio-nfe 16 \
-    --audio-solver heun \
-    --audio-unconditional \
-    --t-sample-mode uniform \
-    --dropout 0.1 \
-    --tui
+python cli.py train --data-dir ./data/latents --out-dir ./runs/v0 --device mps --tui
 ```
 
-**TUI Benefits:**
-- No need to monitor log files with `tail -f`
-- Visual progress tracking with ETA calculations
-- Immediate feedback on training status
-- Automatic phase detection shows when model is initializing vs training vs generating samples
+The TUI shows training progress, loss, learning rate, speed, and ETA without needing to monitor log files.
 
 ## Preprocessing
 

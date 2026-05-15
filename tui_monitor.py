@@ -30,7 +30,7 @@ class TrainingMonitor:
             "eta": "0:00:00",
             "steps_per_sec": 0.0,
         }
-        self.phase = "initializing"  # Can be: initializing, audio_generation, training
+        self.phase = "initializing"  # Can be: initializing, audio_generation, training, saving_checkpoint
         self.audio_generation_info = {
             "current_idx": 0,
             "total_samples": 2,
@@ -78,6 +78,7 @@ class TrainingMonitor:
             # Parse training metrics from log output
             # Format: step=686100/10000000  loss=0.8634  lr=9.94e-05  t=0.583  prefix=336/512  steps/s=2.39
             # Audio generation: [audio] step=686000 idx=0 (uncond) -> ./runs/v3_okachihuali/samples/step_0686000_idx_00.wav (12.29s)
+            # Checkpoint saving: [checkpoint] step=686000 -> ./runs/v3_okachihuali/last.pt
             
             # Detect audio generation phase
             if "[audio]" in line:
@@ -88,6 +89,12 @@ class TrainingMonitor:
                     self.audio_generation_info["current_idx"] = int(audio_idx_match.group(1))
                 if audio_step_match:
                     self.audio_generation_info["current_step"] = int(audio_step_match.group(1))
+            elif "checkpoint" in line.lower() or "saving" in line.lower():
+                self.phase = "saving_checkpoint"
+                # Try to extract step from checkpoint line if available
+                step_match = re.search(r'step[=:](\d+)', line)
+                if step_match:
+                    self.metrics["step"] = int(step_match.group(1))
             elif "step=" in line and "loss=" in line:
                 self.phase = "training"
             
@@ -138,8 +145,18 @@ class TrainingMonitor:
             self._print_audio_generation()
         elif self.phase == "training":
             self._print_training_progress()
+        elif self.phase == "saving_checkpoint":
+            self._print_saving_checkpoint()
         else:
             self._print_initializing()
+    
+    def _print_saving_checkpoint(self) -> None:
+        """Print checkpoint saving status."""
+        step = self.metrics["step"]
+        loading_chars = ["◐", "◑", "◒", "◔"]
+        loading_idx = int(time.time() * 4) % 4
+        loading_char = loading_chars[loading_idx]
+        print(f"\r[{loading_char}] Saving checkpoint at step {step}...", end="", flush=True)
     
     def _print_audio_generation(self) -> None:
         """Print audio generation progress."""

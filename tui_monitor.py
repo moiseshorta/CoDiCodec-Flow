@@ -146,13 +146,20 @@ class TrainingMonitor:
         current_idx = self.audio_generation_info["current_idx"]
         current_step = self.audio_generation_info["current_step"]
         
-        # Create a simple progress indicator
-        progress_str = f"\r[🎵] Generating audio samples | Sample: {current_idx}/2 | Step: {current_step} | Initializing training..."
+        # Use unicode loading animation
+        loading_chars = ["◐", "◑", "◒", "◔"]
+        loading_idx = int(time.time() * 4) % 4
+        loading_char = loading_chars[loading_idx]
+        
+        progress_str = f"\r[{loading_char}] Generating audio samples | Sample: {current_idx}/2 | Step: {current_step} | Initializing training..."
         print(f"{progress_str}", end="", flush=True)
     
     def _print_initializing(self) -> None:
         """Print initialization status."""
-        print(f"\r[⏳] Initializing training...", end="", flush=True)
+        loading_chars = ["◐", "◑", "◒", "◔"]
+        loading_idx = int(time.time() * 4) % 4
+        loading_char = loading_chars[loading_idx]
+        print(f"\r[{loading_char}] Initializing training...", end="", flush=True)
     
     def _print_training_progress(self) -> None:
         """Print training metrics with progress bar."""
@@ -166,10 +173,23 @@ class TrainingMonitor:
         progress = step / self.max_steps if self.max_steps > 0 else 0
         progress_percent = min(100.0, progress * 100)
         
-        # Create progress bar
+        # Create progress bar with unicode gradient characters
         bar_width = 40
-        filled = int(bar_width * progress)
-        bar = "█" * filled + "░" * (bar_width - filled)
+        filled_width = int(bar_width * progress)
+        remainder = (bar_width * progress) - filled_width
+        
+        # Unicode gradient characters from light to dark
+        gradient_chars = [" ", "▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"]
+        
+        # Determine which character to use for the partial fill
+        if remainder > 0:
+            char_idx = int(remainder * len(gradient_chars))
+            partial_char = gradient_chars[min(char_idx, len(gradient_chars) - 1)]
+        else:
+            partial_char = ""
+        
+        bar = "█" * filled_width + partial_char + " " * (bar_width - filled_width - (1 if partial_char else 0))
+        bar = bar[:bar_width]  # Ensure exact width
         
         # Calculate ETA if we have steps/sec
         eta_str = "N/A"

@@ -65,6 +65,23 @@ pip install -e ./codicodec
 python -m flow.smoke_test --device mps  # Use 'cuda' for NVIDIA GPUs
 ```
 
+## CLI Interface
+
+codicodec-flow provides a user-friendly CLI wrapper that simplifies training, preprocessing, and generation without requiring `python -m flow...` commands.
+
+```bash
+# Preprocess audio data
+python cli.py preprocess --in-dir ~/music/training --out-dir ./data/latents --device mps
+
+# Train a model with TUI monitoring
+python cli.py train --data-dir ./data/latents --out-dir ./runs/v0 --device mps --tui
+
+# Generate audio
+python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --out ./out.wav --device mps
+```
+
+The `--tui` flag enables a Terminal User Interface that displays training metrics in real-time, eliminating the need to monitor log files with `tail -f`.
+
 ## Preprocessing
 
 Before training, you need to convert your audio files into latent shards using the CoDiCodec encoder.

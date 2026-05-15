@@ -232,14 +232,6 @@ python -m flow.sample \
 - **Solver**: Heun is more accurate than Euler but ~2x slower.
 - **Temperature**: Higher values increase diversity but may reduce coherence.
 
-## Roadmap
-
-- [x] v0: block-causal CFM continuation model + offline sampling.
-- [ ] v1: streaming inference with KV-cache + `sounddevice` realtime demo.
-- [ ] v2: classifier-free guidance via unconditional prompt dropout.
-- [ ] v3: continuous control knobs (density / brightness) via AdaLN.
-- [ ] v4: consistency / MeanFlow distillation for 1-2 NFE inference.
-
 ## License
 
 Code under `codicodec/` is released under CC BY-NC 4.0 by Sony CSL Paris.

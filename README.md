@@ -84,18 +84,8 @@ python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --out ./o
 
 Before training, you need to convert your audio files into latent shards using the CoDiCodec encoder.
 
-**Option 1: Using CLI (Recommended)**
 ```bash
 python cli.py preprocess \
-    --in-dir   /path/to/your/audio \
-    --out-dir  ./data/latents      \
-    --device   mps                 \
-    --max-seconds 60
-```
-
-**Option 2: Direct Python Module**
-```bash
-python -m flow.data.preencode \
     --in-dir   /path/to/your/audio \
     --out-dir  ./data/latents      \
     --device   mps                 \
@@ -123,21 +113,8 @@ python -m flow.data.preencode \
 
 Train a block-causal Flow Matching DiT model on the preprocessed latents.
 
-**Option 1: Using CLI (Recommended)**
 ```bash
 python cli.py train \
-    --data-dir   ./data/latents \
-    --out-dir    ./runs/v0      \
-    --device     mps            \
-    --batch-size 4              \
-    --grad-accum 2              \
-    --crop-tokens 512          \
-    --max-steps 200000
-```
-
-**Option 2: Direct Python Module**
-```bash
-python -m flow.train \
     --data-dir   ./data/latents \
     --out-dir    ./runs/v0      \
     --device     mps            \
@@ -163,14 +140,14 @@ python -m flow.train \
 
 Default (~97M params, recommended for 36GB+ RAM):
 ```bash
-python -m flow.train --data-dir ./data/latents --out-dir ./runs/v0 \
+python cli.py train --data-dir ./data/latents --out-dir ./runs/v0 \
     --device mps --batch-size 4 --grad-accum 2 --crop-tokens 512 \
     --dtype bf16 --max-steps 200000
 ```
 
 Smaller (~20M params, faster iteration):
 ```bash
-python -m flow.train --data-dir ./data/latents --out-dir ./runs/v0 \
+python cli.py train --data-dir ./data/latents --out-dir ./runs/v0 \
     --device mps --batch-size 8 --grad-accum 2 --crop-tokens 512 \
     --dtype bf16 --max-steps 200000 \
     --dim 384 --n-layers 8 --n-heads 6 --cond-dim 384
@@ -195,21 +172,8 @@ Generate audio continuations using a trained checkpoint.
 
 ### Continuation from a prompt
 
-**Option 1: Using CLI (Recommended)**
 ```bash
 python cli.py sample \
-    --ckpt        ./runs/v0/ema.pt \
-    --prompt-wav  ./prompt.wav     \
-    --duration-s  20               \
-    --nfe         8                \
-    --solver      heun             \
-    --out         ./out.wav        \
-    --device      mps
-```
-
-**Option 2: Direct Python Module**
-```bash
-python -m flow.sample \
     --ckpt        ./runs/v0/ema.pt \
     --prompt-wav  ./prompt.wav     \
     --duration-s  20               \
@@ -232,20 +196,8 @@ python -m flow.sample \
 
 ### Unconditional generation
 
-**Option 1: Using CLI (Recommended)**
 ```bash
 python cli.py sample \
-    --ckpt        ./runs/v0/ema.pt \
-    --duration-s  20               \
-    --nfe         8                \
-    --solver      heun             \
-    --out         ./out_uncond.wav \
-    --device      mps
-```
-
-**Option 2: Direct Python Module**
-```bash
-python -m flow.sample \
     --ckpt        ./runs/v0/ema.pt \
     --duration-s  20               \
     --nfe         8                \
@@ -260,26 +212,17 @@ Omit `--prompt-wav` for unconditional generation (no prompt context).
 
 **Higher quality with more sampling steps:**
 ```bash
-# CLI
 python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duration-s 30 --nfe 16 --solver heun --out ./out_high_quality.wav --device mps
-# Direct
-python -m flow.sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duration-s 30 --nfe 16 --solver heun --out ./out_high_quality.wav --device mps
 ```
 
 **Faster generation with fewer steps:**
 ```bash
-# CLI
 python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duration-s 20 --nfe 4 --solver euler --out ./out_fast.wav --device mps
-# Direct
-python -m flow.sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duration-s 20 --nfe 4 --solver euler --out ./out_fast.wav --device mps
 ```
 
 **Adjust temperature for diversity:**
 ```bash
-# CLI
 python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duration-s 20 --nfe 8 --solver heun --temperature 1.5 --out ./out_diverse.wav --device mps
-# Direct
-python -m flow.sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duration-s 20 --nfe 8 --solver heun --temperature 1.5 --out ./out_diverse.wav --device mps
 ```
 
 **Sampling Trade-offs:**

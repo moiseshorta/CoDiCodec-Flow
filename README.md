@@ -48,37 +48,189 @@ codicodec-flow/
   README.md            (this file)
 ```
 
-## Quickstart
+## Installation
 
 ```bash
-# 1. Environment
-python -m venv .venv && source .venv/bin/activate
+# Create virtual environment
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# Install dependencies
 pip install -r requirements.txt
-pip install -e ./codicodec    # makes the upstream package importable
 
-# 2. Verify codec works on your machine (downloads checkpoint on first run)
-python -m flow.smoke_test
+# Install the upstream CoDiCodec package
+pip install -e ./codicodec
 
-# 3. Pre-encode an audio folder to latent shards
+# Verify codec works on your machine (downloads checkpoint on first run)
+python -m flow.smoke_test --device mps  # Use 'cuda' for NVIDIA GPUs
+```
+
+## Preprocessing
+
+Before training, you need to convert your audio files into latent shards using the CoDiCodec encoder.
+
+```bash
 python -m flow.data.preencode \
-    --in-dir   ~/music/training \
-    --out-dir  ./data/latents   \
-    --device   mps
+    --in-dir   /path/to/your/audio \
+    --out-dir  ./data/latents      \
+    --device   mps                 \
+    --max-seconds 60
+```
 
-# 4. Train a tiny continuation model
+**Arguments:**
+- `--in-dir`: Directory containing audio files (WAV, MP3, FLAC, etc.)
+- `--out-dir`: Output directory for latent shards (.pt files)
+- `--device`: `mps` for Apple Silicon, `cuda` for NVIDIA GPUs, `cpu` as fallback
+- `--max-seconds`: Maximum duration per file (default: 300s). Longer files are split.
+
+**Output:**
+- Each audio file produces a `.pt` file containing the encoded latent representation
+- Latents are stored as `[T, 8, 64]` tensors (T = number of 0.683s chunks)
+- Files are stored with metadata for the dataset loader
+
+**Tips:**
+- Use diverse audio for better generalization (different styles, instruments, tempos)
+- 48 kHz stereo audio is recommended (CoDiCodec's native rate)
+- Aim for several hours of audio for reasonable training
+
+## Training
+
+Train a block-causal Flow Matching DiT model on the preprocessed latents.
+
+```bash
 python -m flow.train \
-    --data-dir ./data/latents   \
-    --out-dir  ./runs/v0        \
-    --device   mps
+    --data-dir   ./data/latents \
+    --out-dir    ./runs/v0      \
+    --device     mps            \
+    --batch-size 4              \
+    --grad-accum 2              \
+    --crop-tokens 512          \
+    --max-steps 200000
+```
 
-# 5. Generate a continuation of a prompt audio file
+**Key Arguments:**
+- `--data-dir`: Directory containing preprocessed latent shards
+- `--out-dir`: Output directory for checkpoints and logs
+- `--device`: `mps`, `cuda`, or `cpu`
+- `--batch-size`: Batch size per GPU (default: 8, use 4 on MPS)
+- `--grad-accum`: Gradient accumulation steps (effective batch = batch_size × grad_accum)
+- `--crop-tokens`: Random crop length in tokens (default: 768, must be multiple of 8)
+- `--max-steps`: Total training steps (default: 200000)
+- `--dtype`: `bf16` for bfloat16 (faster, less memory) or `fp32` for float32
+- `--lr`: Learning rate (default: 1e-4 with cosine decay)
+- `--ema-decay`: EMA decay rate (default: 0.9999)
+
+**Model Size Configuration:**
+
+Default (~97M params, recommended for 36GB+ RAM):
+```bash
+python -m flow.train --data-dir ./data/latents --out-dir ./runs/v0 \
+    --device mps --batch-size 4 --grad-accum 2 --crop-tokens 512 \
+    --dtype bf16 --max-steps 200000
+```
+
+Smaller (~20M params, faster iteration):
+```bash
+python -m flow.train --data-dir ./data/latents --out-dir ./runs/v0 \
+    --device mps --batch-size 8 --grad-accum 2 --crop-tokens 512 \
+    --dtype bf16 --max-steps 200000 \
+    --dim 384 --n-layers 8 --n-heads 6 --cond-dim 384
+```
+
+**Training Details:**
+- Checkpoints are saved every 50 steps: `last.pt` (latest) and `ema.pt` (EMA copy)
+- Periodic audio samples are generated during training (unconditional by default)
+- Use `--audio-continuation` to enable continuation sampling during training
+- Use `--audio-sample-every N` to control sampling frequency (0 to disable)
+- Logs include loss, learning rate, and sample metrics
+
+**Monitoring:**
+```bash
+# View training logs
+tensorboard --logdir ./runs/v0
+```
+
+## Generation
+
+Generate audio continuations using a trained checkpoint.
+
+### Continuation from a prompt
+
+```bash
 python -m flow.sample \
     --ckpt        ./runs/v0/ema.pt \
     --prompt-wav  ./prompt.wav     \
     --duration-s  20               \
+    --nfe         8                \
+    --solver      heun             \
     --out         ./out.wav        \
     --device      mps
 ```
+
+**Arguments:**
+- `--ckpt`: Path to checkpoint (use `ema.pt` for best quality, `last.pt` for latest)
+- `--prompt-wav`: Audio prompt file (WAV, 48 kHz stereo recommended)
+- `--duration-s`: Duration of continuation in seconds (default: 20)
+- `--nfe`: Number of function evaluations (sampling steps, default: 8)
+- `--solver`: ODE solver: `euler` (faster) or `heun` (better quality)
+- `--out`: Output audio file path
+- `--device`: `mps`, `cuda`, or `cpu`
+- `--temperature`: Sampling temperature (default: 1.0, higher = more diverse)
+- `--n-steps`: Number of diffusion steps (default: 32)
+
+### Unconditional generation
+
+```bash
+python -m flow.sample \
+    --ckpt        ./runs/v0/ema.pt \
+    --duration-s  20               \
+    --nfe         8                \
+    --solver      heun             \
+    --out         ./out_uncond.wav \
+    --device      mps
+```
+
+Omit `--prompt-wav` for unconditional generation (no prompt context).
+
+### Advanced options
+
+```bash
+# Higher quality with more sampling steps
+python -m flow.sample \
+    --ckpt ./runs/v0/ema.pt \
+    --prompt-wav ./prompt.wav \
+    --duration-s 30 \
+    --nfe 16 \
+    --solver heun \
+    --out ./out_high_quality.wav \
+    --device mps
+
+# Faster generation with fewer steps
+python -m flow.sample \
+    --ckpt ./runs/v0/ema.pt \
+    --prompt-wav ./prompt.wav \
+    --duration-s 20 \
+    --nfe 4 \
+    --solver euler \
+    --out ./out_fast.wav \
+    --device mps
+
+# Adjust temperature for diversity
+python -m flow.sample \
+    --ckpt ./runs/v0/ema.pt \
+    --prompt-wav ./prompt.wav \
+    --duration-s 20 \
+    --nfe 8 \
+    --solver heun \
+    --temperature 1.5 \
+    --out ./out_diverse.wav \
+    --device mps
+```
+
+**Sampling Trade-offs:**
+- **NFE (steps)**: More steps = better quality but slower. 4-8 is real-time, 16+ is high quality.
+- **Solver**: Heun is more accurate than Euler but ~2x slower.
+- **Temperature**: Higher values increase diversity but may reduce coherence.
 
 ## Roadmap
 

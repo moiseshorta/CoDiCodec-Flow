@@ -75,7 +75,7 @@ class TrainingMonitor:
             loss_match = re.search(r'loss[=:]([\d.]+)', line)
             lr_match = re.search(r'lr[=:]([\d.e-]+)', line)
             val_loss_match = re.search(r'val_loss[=:]([\d.]+)', line)
-            steps_per_sec_match = re.search(r'step/s[=:]([\d.]+)', line)
+            steps_per_sec_match = re.search(r'steps/s[=:]([\d.]+)', line)
             
             if step_match:
                 self.metrics["step"] = int(step_match.group(1))
@@ -87,9 +87,6 @@ class TrainingMonitor:
                 self.metrics["val_loss"] = float(val_loss_match.group(1))
             if steps_per_sec_match:
                 self.metrics["steps_per_sec"] = float(steps_per_sec_match.group(1))
-            
-            # Print raw output for debugging (optional, can be disabled)
-            # print(f"\r{line}", end="", flush=True)
     
     def _display_metrics(self) -> None:
         """Display training metrics in a clean TUI format."""

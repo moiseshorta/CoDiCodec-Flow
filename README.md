@@ -80,12 +80,72 @@ python cli.py train --data-dir ./data/latents --out-dir ./runs/v0 --device mps -
 python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --out ./out.wav --device mps
 ```
 
+### TUI (Terminal User Interface)
+
 The `--tui` flag enables a Terminal User Interface that displays training metrics in real-time, eliminating the need to monitor log files with `tail -f`.
+
+**TUI Features:**
+- **Real-time progress bar** with unicode gradient characters (▏▎▍▌▋▊▉█) showing training progress percentage
+- **Live metrics display** including step count, loss, learning rate, training speed, and estimated time remaining (ETA)
+- **Phase detection** automatically identifies different training phases:
+  - ◐ **Initializing**: Model loading and data preparation
+  - ◐ **Audio generation**: Generating sample audio before training begins
+  - **Progress bar**: Active training with full metrics
+- **Animated loading indicators** (◐, ◑, ◒, ◔) for non-training phases
+
+**TUI Display Example:**
+```
+[██▊                                     ]   6.9% | Step:   686056/10000000 | Loss: 0.7959 | LR: 9.94e-05 | Speed: 2.04 steps/s | ETA: 1268:14:18
+```
+
+**Using TUI for Training:**
+```bash
+python cli.py train \
+    --data-dir ./data/latents \
+    --out-dir ./runs/v0 \
+    --device mps \
+    --batch-size 4 \
+    --grad-accum 2 \
+    --crop-tokens 512 \
+    --max-steps 10000000 \
+    --warmup-steps 202000 \
+    --lr 1e-4 \
+    --num-workers 0 \
+    --log-every 100 \
+    --val-every 2000 \
+    --ckpt-every 2000 \
+    --audio-sample-every 2000 \
+    --audio-n-samples 2 \
+    --audio-prompt-seconds 4 \
+    --audio-continuation-seconds 8 \
+    --audio-nfe 16 \
+    --audio-solver heun \
+    --audio-unconditional \
+    --t-sample-mode uniform \
+    --dropout 0.1 \
+    --tui
+```
+
+**TUI Benefits:**
+- No need to monitor log files with `tail -f`
+- Visual progress tracking with ETA calculations
+- Immediate feedback on training status
+- Automatic phase detection shows when model is initializing vs training vs generating samples
 
 ## Preprocessing
 
 Before training, you need to convert your audio files into latent shards using the CoDiCodec encoder.
 
+**Option 1: Using CLI (Recommended)**
+```bash
+python cli.py preprocess \
+    --in-dir   /path/to/your/audio \
+    --out-dir  ./data/latents      \
+    --device   mps                 \
+    --max-seconds 60
+```
+
+**Option 2: Direct Python Module**
 ```bash
 python -m flow.data.preencode \
     --in-dir   /path/to/your/audio \
@@ -115,6 +175,20 @@ python -m flow.data.preencode \
 
 Train a block-causal Flow Matching DiT model on the preprocessed latents.
 
+**Option 1: Using CLI with TUI (Recommended)**
+```bash
+python cli.py train \
+    --data-dir   ./data/latents \
+    --out-dir    ./runs/v0      \
+    --device     mps            \
+    --batch-size 4              \
+    --grad-accum 2              \
+    --crop-tokens 512          \
+    --max-steps 200000         \
+    --tui
+```
+
+**Option 2: Direct Python Module**
 ```bash
 python -m flow.train \
     --data-dir   ./data/latents \
@@ -174,6 +248,19 @@ Generate audio continuations using a trained checkpoint.
 
 ### Continuation from a prompt
 
+**Option 1: Using CLI (Recommended)**
+```bash
+python cli.py sample \
+    --ckpt        ./runs/v0/ema.pt \
+    --prompt-wav  ./prompt.wav     \
+    --duration-s  20               \
+    --nfe         8                \
+    --solver      heun             \
+    --out         ./out.wav        \
+    --device      mps
+```
+
+**Option 2: Direct Python Module**
 ```bash
 python -m flow.sample \
     --ckpt        ./runs/v0/ema.pt \
@@ -198,6 +285,18 @@ python -m flow.sample \
 
 ### Unconditional generation
 
+**Option 1: Using CLI (Recommended)**
+```bash
+python cli.py sample \
+    --ckpt        ./runs/v0/ema.pt \
+    --duration-s  20               \
+    --nfe         8                \
+    --solver      heun             \
+    --out         ./out_uncond.wav \
+    --device      mps
+```
+
+**Option 2: Direct Python Module**
 ```bash
 python -m flow.sample \
     --ckpt        ./runs/v0/ema.pt \
@@ -212,37 +311,28 @@ Omit `--prompt-wav` for unconditional generation (no prompt context).
 
 ### Advanced options
 
+**Higher quality with more sampling steps:**
 ```bash
-# Higher quality with more sampling steps
-python -m flow.sample \
-    --ckpt ./runs/v0/ema.pt \
-    --prompt-wav ./prompt.wav \
-    --duration-s 30 \
-    --nfe 16 \
-    --solver heun \
-    --out ./out_high_quality.wav \
-    --device mps
+# CLI
+python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duration-s 30 --nfe 16 --solver heun --out ./out_high_quality.wav --device mps
+# Direct
+python -m flow.sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duration-s 30 --nfe 16 --solver heun --out ./out_high_quality.wav --device mps
+```
 
-# Faster generation with fewer steps
-python -m flow.sample \
-    --ckpt ./runs/v0/ema.pt \
-    --prompt-wav ./prompt.wav \
-    --duration-s 20 \
-    --nfe 4 \
-    --solver euler \
-    --out ./out_fast.wav \
-    --device mps
+**Faster generation with fewer steps:**
+```bash
+# CLI
+python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duration-s 20 --nfe 4 --solver euler --out ./out_fast.wav --device mps
+# Direct
+python -m flow.sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duration-s 20 --nfe 4 --solver euler --out ./out_fast.wav --device mps
+```
 
-# Adjust temperature for diversity
-python -m flow.sample \
-    --ckpt ./runs/v0/ema.pt \
-    --prompt-wav ./prompt.wav \
-    --duration-s 20 \
-    --nfe 8 \
-    --solver heun \
-    --temperature 1.5 \
-    --out ./out_diverse.wav \
-    --device mps
+**Adjust temperature for diversity:**
+```bash
+# CLI
+python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duration-s 20 --nfe 8 --solver heun --temperature 1.5 --out ./out_diverse.wav --device mps
+# Direct
+python -m flow.sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duration-s 20 --nfe 8 --solver heun --temperature 1.5 --out ./out_diverse.wav --device mps
 ```
 
 **Sampling Trade-offs:**

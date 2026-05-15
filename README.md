@@ -51,9 +51,9 @@ codicodec-flow/
 ## Installation
 
 ```bash
-# Create virtual environment
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+# Create conda environment
+conda create -n codicodec-flow python=3.10
+conda activate codicodec-flow
 
 # Install dependencies
 pip install -r requirements.txt

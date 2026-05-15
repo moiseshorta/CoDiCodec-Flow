@@ -17,8 +17,7 @@ sequence.
   transform, are approximately unit-Gaussian — a direct fit for flow
   matching.
 - **Block-causal Flow Matching DiT** is the simplest architecture that:
-  1. respects the codec's chunk structure (8 latent tokens per ~0.683 s
-     chunk, permutation-invariant within a chunk),
+  1. respects the codec's chunk structure,
   2. supports KV-caching for efficient streaming inference,
   3. has unconditional dropout-based classifier-free guidance for free.
 - The whole pipeline is **MPS-friendly** so it can be trained and run in

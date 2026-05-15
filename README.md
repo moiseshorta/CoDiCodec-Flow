@@ -1,5 +1,7 @@
 # CoDiCodec-Flow
 
+> Author: Moisés Horta Valenzuela, ([hexorcismos](http://hexorcismos.bandcamp.com))  2026
+
 A generative model that synthesises audio in CoDiCodec's continuous latent space
 using Conditional Flow Matching (CFM) on a block-causal DiT architecture.
 
@@ -241,7 +243,7 @@ These examples demonstrate the model's ability to generate coherent musical cont
 
 ## Credits
 
-**codicodec-flow Architecture**
+**CoDiCodec-Flow Architecture**
 - Moisés Horta Valenzuela, 2026
 
 **CoDiCodec**

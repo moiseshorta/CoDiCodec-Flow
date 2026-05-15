@@ -30,6 +30,12 @@ class TrainingMonitor:
             "eta": "0:00:00",
             "steps_per_sec": 0.0,
         }
+        self.phase = "initializing"  # Can be: initializing, audio_generation, training
+        self.audio_generation_info = {
+            "current_idx": 0,
+            "total_samples": 2,
+            "current_step": 0,
+        }
     
     def start_training(self, args: list) -> None:
         """Start the training process with given arguments."""
@@ -71,6 +77,20 @@ class TrainingMonitor:
             
             # Parse training metrics from log output
             # Format: step=686100/10000000  loss=0.8634  lr=9.94e-05  t=0.583  prefix=336/512  steps/s=2.39
+            # Audio generation: [audio] step=686000 idx=0 (uncond) -> ./runs/v3_okachihuali/samples/step_0686000_idx_00.wav (12.29s)
+            
+            # Detect audio generation phase
+            if "[audio]" in line:
+                self.phase = "audio_generation"
+                audio_idx_match = re.search(r'idx[=:](\d+)', line)
+                audio_step_match = re.search(r'step[=:](\d+)', line)
+                if audio_idx_match:
+                    self.audio_generation_info["current_idx"] = int(audio_idx_match.group(1))
+                if audio_step_match:
+                    self.audio_generation_info["current_step"] = int(audio_step_match.group(1))
+            elif "step=" in line and "loss=" in line:
+                self.phase = "training"
+            
             step_match = re.search(r'step[=:](\d+)/\d+', line)
             loss_match = re.search(r'loss[=:]([\d.]+)', line)
             lr_match = re.search(r'lr[=:]([\d.e-]+)', line)
@@ -114,6 +134,28 @@ class TrainingMonitor:
     
     def _print_metrics(self) -> None:
         """Print current training metrics with progress bar."""
+        if self.phase == "audio_generation":
+            self._print_audio_generation()
+        elif self.phase == "training":
+            self._print_training_progress()
+        else:
+            self._print_initializing()
+    
+    def _print_audio_generation(self) -> None:
+        """Print audio generation progress."""
+        current_idx = self.audio_generation_info["current_idx"]
+        current_step = self.audio_generation_info["current_step"]
+        
+        # Create a simple progress indicator
+        progress_str = f"\r[🎵] Generating audio samples | Sample: {current_idx}/2 | Step: {current_step} | Initializing training..."
+        print(f"{progress_str}", end="", flush=True)
+    
+    def _print_initializing(self) -> None:
+        """Print initialization status."""
+        print(f"\r[⏳] Initializing training...", end="", flush=True)
+    
+    def _print_training_progress(self) -> None:
+        """Print training metrics with progress bar."""
         step = self.metrics["step"]
         loss = self.metrics["loss"]
         lr = self.metrics["lr"]

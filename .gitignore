@@ -52,6 +52,9 @@ runs/
 *.flac
 *.ogg
 
+# Examples (keep audio files in examples/)
+!examples/*.wav
+
 # Logs
 *.log
 

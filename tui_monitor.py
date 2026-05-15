@@ -70,8 +70,8 @@ class TrainingMonitor:
             line = line.strip()
             
             # Parse training metrics from log output
-            # Common patterns: step=1000 loss=0.5 lr=1e-4 steps/s=2.5
-            step_match = re.search(r'step[=:](\d+)', line)
+            # Format: step=686100/10000000  loss=0.8634  lr=9.94e-05  t=0.583  prefix=336/512  steps/s=2.39
+            step_match = re.search(r'step[=:](\d+)/\d+', line)
             loss_match = re.search(r'loss[=:]([\d.]+)', line)
             lr_match = re.search(r'lr[=:]([\d.e-]+)', line)
             val_loss_match = re.search(r'val_loss[=:]([\d.]+)', line)

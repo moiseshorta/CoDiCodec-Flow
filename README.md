@@ -92,6 +92,7 @@ python -m flow.data.preencode \
 - Use diverse audio for better generalization (different styles, instruments, tempos)
 - 48 kHz stereo audio is recommended (CoDiCodec's native rate)
 - Aim for several hours of audio for reasonable training
+- Train for at least 100K steps for meaningful results; the v3_okachihuali model was trained for 6,860,000 steps
 
 ## Training
 

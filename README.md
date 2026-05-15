@@ -159,12 +159,6 @@ python cli.py train --data-dir ./data/latents --out-dir ./runs/v0 \
 - Use `--audio-sample-every N` to control sampling frequency (0 to disable)
 - Logs include loss, learning rate, and sample metrics
 
-**Monitoring:**
-```bash
-# View training logs
-tensorboard --logdir ./runs/v0
-```
-
 ## Generation
 
 Generate audio continuations using a trained checkpoint.

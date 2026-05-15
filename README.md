@@ -8,7 +8,7 @@ short audio prompt, it generates an arbitrarily long continuation in a
 chunk-causal, streaming fashion on the codec's ~11.7 Hz, 64-channel latent
 sequence.
 
-## Why this design
+## Design
 
 - **CoDiCodec** ([Pasini et al., 2025](https://arxiv.org/pdf/2509.09836))
   encodes 48 kHz stereo audio to summary embeddings at ~11.7 Hz with 64

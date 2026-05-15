@@ -17,16 +17,18 @@ import sys
 class TrainingMonitor:
     """Monitors training process and displays metrics in TUI format."""
     
-    def __init__(self, out_dir: str):
+    def __init__(self, out_dir: str, max_steps: int = 200000):
         self.out_dir = Path(out_dir)
         self.process: Optional[subprocess.Popen] = None
         self.running = False
+        self.max_steps = max_steps
         self.metrics = {
             "step": 0,
             "loss": 0.0,
             "lr": 0.0,
             "val_loss": 0.0,
             "eta": "0:00:00",
+            "steps_per_sec": 0.0,
         }
     
     def start_training(self, args: list) -> None:
@@ -68,11 +70,12 @@ class TrainingMonitor:
             line = line.strip()
             
             # Parse training metrics from log output
-            # Common patterns: step=1000 loss=0.5 lr=1e-4
+            # Common patterns: step=1000 loss=0.5 lr=1e-4 steps/s=2.5
             step_match = re.search(r'step[=:](\d+)', line)
             loss_match = re.search(r'loss[=:]([\d.]+)', line)
             lr_match = re.search(r'lr[=:]([\d.e-]+)', line)
             val_loss_match = re.search(r'val_loss[=:]([\d.]+)', line)
+            steps_per_sec_match = re.search(r'step/s[=:]([\d.]+)', line)
             
             if step_match:
                 self.metrics["step"] = int(step_match.group(1))
@@ -82,9 +85,11 @@ class TrainingMonitor:
                 self.metrics["lr"] = float(lr_match.group(1))
             if val_loss_match:
                 self.metrics["val_loss"] = float(val_loss_match.group(1))
+            if steps_per_sec_match:
+                self.metrics["steps_per_sec"] = float(steps_per_sec_match.group(1))
             
-            # Print raw output for debugging
-            print(f"\r{line}", end="", flush=True)
+            # Print raw output for debugging (optional, can be disabled)
+            # print(f"\r{line}", end="", flush=True)
     
     def _display_metrics(self) -> None:
         """Display training metrics in a clean TUI format."""
@@ -111,24 +116,47 @@ class TrainingMonitor:
         print("\r\033[K", end="", flush=True)
     
     def _print_metrics(self) -> None:
-        """Print current training metrics."""
+        """Print current training metrics with progress bar."""
         step = self.metrics["step"]
         loss = self.metrics["loss"]
         lr = self.metrics["lr"]
         val_loss = self.metrics["val_loss"]
+        steps_per_sec = self.metrics["steps_per_sec"]
+        
+        # Calculate progress
+        progress = step / self.max_steps if self.max_steps > 0 else 0
+        progress_percent = min(100.0, progress * 100)
+        
+        # Create progress bar
+        bar_width = 40
+        filled = int(bar_width * progress)
+        bar = "█" * filled + "░" * (bar_width - filled)
+        
+        # Calculate ETA if we have steps/sec
+        eta_str = "N/A"
+        if steps_per_sec > 0:
+            remaining_steps = self.max_steps - step
+            eta_seconds = remaining_steps / steps_per_sec
+            eta_str = self._format_time(eta_seconds)
         
         # Format metrics
         metrics_str = (
-            f"Step: {step:>8} | "
+            f"\r[{bar}] {progress_percent:>5.1f}% | "
+            f"Step: {step:>8}/{self.max_steps} | "
             f"Loss: {loss:.4f} | "
             f"LR: {lr:.2e} | "
-            f"Val Loss: {val_loss:.4f}" if val_loss > 0 else
-            f"Step: {step:>8} | "
-            f"Loss: {loss:.4f} | "
-            f"LR: {lr:.2e}"
+            f"Speed: {steps_per_sec:.2f} steps/s | "
+            f"ETA: {eta_str}"
         )
         
-        print(f"\r{metrics_str}", end="", flush=True)
+        print(f"{metrics_str}", end="", flush=True)
+    
+    def _format_time(self, seconds: float) -> str:
+        """Format seconds as HH:MM:SS."""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
 def launch_tui_train(
@@ -139,8 +167,22 @@ def launch_tui_train(
     grad_accum: int = 2,
     crop_tokens: int = 512,
     max_steps: int = 200000,
+    warmup_steps: int = 2000,
     dtype: str = "bf16",
     lr: float = 1e-4,
+    num_workers: int = 0,
+    log_every: int = 50,
+    val_every: int = 1000,
+    ckpt_every: int = 1000,
+    audio_sample_every: int = 0,
+    audio_n_samples: int = 2,
+    audio_prompt_seconds: float = 4,
+    audio_continuation_seconds: float = 8,
+    audio_nfe: int = 16,
+    audio_solver: str = "heun",
+    audio_unconditional: bool = False,
+    t_sample_mode: str = "uniform",
+    dropout: float = 0.1,
     dim: Optional[int] = None,
     n_layers: Optional[int] = None,
     n_heads: Optional[int] = None,
@@ -156,9 +198,25 @@ def launch_tui_train(
         "--grad-accum", str(grad_accum),
         "--crop-tokens", str(crop_tokens),
         "--max-steps", str(max_steps),
+        "--warmup-steps", str(warmup_steps),
         "--dtype", dtype,
+        "--lr", str(lr),
+        "--num-workers", str(num_workers),
+        "--log-every", str(log_every),
+        "--val-every", str(val_every),
+        "--ckpt-every", str(ckpt_every),
+        "--audio-sample-every", str(audio_sample_every),
+        "--audio-n-samples", str(audio_n_samples),
+        "--audio-prompt-seconds", str(audio_prompt_seconds),
+        "--audio-continuation-seconds", str(audio_continuation_seconds),
+        "--audio-nfe", str(audio_nfe),
+        "--audio-solver", audio_solver,
+        "--t-sample-mode", t_sample_mode,
+        "--dropout", str(dropout),
     ]
     
+    if audio_unconditional:
+        args.append("--audio-unconditional")
     if dim:
         args.extend(["--dim", str(dim)])
     if n_layers:
@@ -169,7 +227,7 @@ def launch_tui_train(
         args.extend(["--cond-dim", str(cond_dim)])
     
     # Create monitor and start training
-    monitor = TrainingMonitor(out_dir)
+    monitor = TrainingMonitor(out_dir, max_steps=max_steps)
     
     try:
         monitor.start_training(args)

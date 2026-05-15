@@ -73,22 +73,12 @@ codicodec-flow provides a user-friendly CLI wrapper that simplifies training, pr
 # Preprocess audio data
 python cli.py preprocess --in-dir ~/music/training --out-dir ./data/latents --device mps
 
-# Train a model with TUI monitoring
-python cli.py train --data-dir ./data/latents --out-dir ./runs/v0 --device mps --tui
+# Train a model (TUI monitoring enabled by default)
+python cli.py train --data-dir ./data/latents --out-dir ./runs/v0 --device mps
 
 # Generate audio
 python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --out ./out.wav --device mps
 ```
-
-### TUI (Terminal User Interface)
-
-Add `--tui` to any training command to enable real-time monitoring with a progress bar and metrics display.
-
-```bash
-python cli.py train --data-dir ./data/latents --out-dir ./runs/v0 --device mps --tui
-```
-
-The TUI shows training progress, loss, learning rate, speed, and ETA without needing to monitor log files.
 
 ## Preprocessing
 
@@ -133,7 +123,7 @@ python -m flow.data.preencode \
 
 Train a block-causal Flow Matching DiT model on the preprocessed latents.
 
-**Option 1: Using CLI with TUI (Recommended)**
+**Option 1: Using CLI (Recommended)**
 ```bash
 python cli.py train \
     --data-dir   ./data/latents \
@@ -142,8 +132,7 @@ python cli.py train \
     --batch-size 4              \
     --grad-accum 2              \
     --crop-tokens 512          \
-    --max-steps 200000         \
-    --tui
+    --max-steps 200000
 ```
 
 **Option 2: Direct Python Module**

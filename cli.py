@@ -65,7 +65,7 @@ Examples:
     train_parser.add_argument("--n-layers", type=int, default=None, help="Number of layers")
     train_parser.add_argument("--n-heads", type=int, default=None, help="Number of heads")
     train_parser.add_argument("--cond-dim", type=int, default=None, help="Conditioning dimension")
-    train_parser.add_argument("--tui", action="store_true", help="Enable TUI for monitoring training")
+    train_parser.add_argument("--no-tui", action="store_true", help="Disable TUI for monitoring training")
     
     # Sample command
     sample_parser = subparsers.add_parser("sample", help="Generate audio from a checkpoint")
@@ -85,7 +85,7 @@ Examples:
         sys.argv = ["preencode", "--in-dir", args.in_dir, "--out-dir", args.out_dir, "--device", args.device, "--max-seconds", str(args.max_seconds)]
         flow.data.preencode.main()
     elif args.command == "train":
-        if args.tui:
+        if not args.no_tui:
             import tui_monitor
             tui_monitor.launch_tui_train(
                 data_dir=args.data_dir,

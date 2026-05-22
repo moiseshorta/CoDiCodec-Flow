@@ -263,7 +263,8 @@ These examples demonstrate the model's ability to generate coherent musical cont
 
 **CoDiCodec**
 - The upstream CoDiCodec encoder/decoder is released by Sony CSL Paris under CC BY-NC 4.0
-- Paper: Pasini et al., 2025 - [CoDiCodec: Codec-based Audio Generation with Discrete Latents](https://arxiv.org/pdf/2509.09836)
+- Paper: Pasini et al., 2025 - [CoDiCodec: UNIFYING CONTINUOUS AND DISCRETE COMPRESSED
+REPRESENTATIONS OF AUDIO](https://arxiv.org/pdf/2509.09836)
 - Original repository: [https://github.com/sony/codicodec](https://github.com/sony/codicodec)
 
 **License**

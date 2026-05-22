@@ -2,7 +2,8 @@
 
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/moiseshorta/CoDiCodec-Flow/blob/main/colab/CoDiCodec_Flow.ipynb)
 
-> Author: Moisés Horta Valenzuela, [hexorcismos](http://hexorcismos.bandcamp.com),  2026
+> Author: Moisés Horta Valenzuela, [hexorcismos](http://hexorcismos.bandcamp.com)
+> Date: May 2026
 
 A generative model that synthesises audio in CoDiCodec's continuous latent space
 using Conditional Flow Matching (CFM) on a block-causal DiT architecture.

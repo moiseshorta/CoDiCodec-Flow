@@ -1,5 +1,7 @@
 # CoDiCodec-Flow
 
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/moiseshorta/CoDiCodec-Flow/blob/main/colab/CoDiCodec_Flow.ipynb)
+
 > Author: Moisés Horta Valenzuela, [hexorcismos](http://hexorcismos.bandcamp.com),  2026
 
 A generative model that synthesises audio in CoDiCodec's continuous latent space
@@ -24,6 +26,17 @@ sequence.
   3. has unconditional dropout-based classifier-free guidance for free.
 - The whole pipeline is **MPS-friendly** so it can be trained and run in
   real-time on a 36 GB Apple Silicon laptop.
+
+## Google Colab
+
+Try CoDiCodec-Flow directly in your browser using the Google Colab notebook in the `colab/` directory. The notebook provides a step-by-step guide for:
+
+- Cloning the repository and setting up the environment
+- Preprocessing audio data to latents
+- Training a model on your data
+- Generating audio continuations
+
+Click the badge at the top of this README to open the notebook in Colab.
 
 ## Repository layout
 

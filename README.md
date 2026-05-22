@@ -1,4 +1,4 @@
-# CoDiCodec-Flow
+# CoDiCodec-Flow: Realtime audio generation model using Flow Matching DiT on CoDiCodec latents.
 
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/moiseshorta/CoDiCodec-Flow/blob/main/colab/CoDiCodec_Flow.ipynb)
 

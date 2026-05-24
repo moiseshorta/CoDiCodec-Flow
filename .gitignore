@@ -1,7 +1,8 @@
-# # GUI (Electron)
-# electron-gui/
-# build-staging/
-# dist/
+# GUI (Electron)
+electron-gui/
+build-staging/
+dist/
+fonts/
 
 # Python
 __pycache__/
@@ -60,3 +61,6 @@ runs/
 
 # Temporary files
 *.tmp
+
+# Build script (keep this)
+!build_macapp.sh

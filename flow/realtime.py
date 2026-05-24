@@ -77,6 +77,13 @@ from .config import ModelConfig
 from .model.dit import FlowDiT
 from .model.ema import EMA
 from .utils import best_device, block_causal_mask, get_logger
+from .model.cfm import sample as cfm_sample
+
+try:
+    from .coreml_utils import CoreMLBackend, check_coreml_available
+    COREML_AVAILABLE = check_coreml_available()
+except ImportError:
+    COREML_AVAILABLE = False
 
 logger = get_logger("flow.realtime")
 
@@ -140,6 +147,40 @@ def load_model(ckpt_path: str, device: torch.device, *, use_ema: bool) -> FlowDi
 # Single-chunk CFM sampler (in normalized space, with temperature).
 # --------------------------------------------------------------------------- #
 
+SUPPORTED_RT_SOLVERS = ("euler", "heun", "midpoint", "rk4", "dpmpp", "pingpong")
+
+
+def _rt_apply_target(x: torch.Tensor, P: int, new_target: torch.Tensor) -> torch.Tensor:
+    out = x.clone()
+    out[:, P:] = new_target
+    return out
+
+
+def _rt_build_schedule(n_steps: int, schedule: str, schedule_shift: float) -> List[float]:
+    """Return a list of (n_steps + 1) floats from 1.0 -> 0.0.
+
+    Mirrors `flow.model.cfm._build_schedule` but returns plain Python floats so
+    the realtime per-chunk hot path stays free of tensor ops for time scalars.
+    """
+    if n_steps <= 0:
+        return [1.0, 0.0]
+    base = [1.0 - k / n_steps for k in range(n_steps + 1)]
+    if schedule != "shifted" or schedule_shift == 0.0:
+        # 'linear' or no-op shift.
+        return base
+    mu = math.exp(float(schedule_shift))
+    out = []
+    for t in base:
+        if t >= 1.0 - 1e-9:
+            out.append(1.0)
+        elif t <= 1e-9:
+            out.append(0.0)
+        else:
+            tc = min(max(t, 1e-6), 1.0 - 1e-6)
+            out.append(mu * tc / (1.0 + (mu - 1.0) * tc))
+    return out
+
+
 @torch.no_grad()
 def diffuse_chunk(
     model: FlowDiT,
@@ -149,6 +190,9 @@ def diffuse_chunk(
     solver: str,
     temperature: float,
     init_noise: Optional[torch.Tensor] = None,
+    schedule: str = "linear",
+    schedule_shift: float = 0.0,
+    coreml_backend: Optional[CoreMLBackend] = None,
 ) -> torch.Tensor:
     """Generate one chunk (`block_size` tokens) given a clean *normalized* prefix.
 
@@ -156,10 +200,16 @@ def diffuse_chunk(
         model: trained FlowDiT (eval mode).
         prefix_norm: `[1, P, latent_dim]` already in normalized space.
         n_steps: number of ODE integration steps.
-        solver: 'euler' | 'heun'.
+        solver: one of ``SUPPORTED_RT_SOLVERS``:
+            ``euler`` (1 NFE/step), ``heun`` (2), ``midpoint`` (2),
+            ``rk4`` (4), ``dpmpp`` (DPM-Solver++ 2M, 1 NFE/step) or
+            ``pingpong`` (stochastic SDE, 1 NFE/step).
         temperature: scales the predicted velocity each step
-            (`x <- x - (dt / temperature) * v`). 1.0 = standard rectified-flow
-            ODE; <1 sharpens; >1 diffuses.
+            (``v_eff = v / temperature``). 1.0 = standard rectified-flow ODE;
+            <1 sharpens (faster collapse); >1 diffuses (more residual noise).
+            For ``dpmpp`` this rescales the velocity used to form ``denoised``.
+            For ``pingpong`` it scales the velocity going into ``denoised``;
+            the re-noising step is unchanged.
         init_noise: optional `[1, block_size, latent_dim]` to start from
             (otherwise sampled from `N(0, I)` per call).
 
@@ -167,6 +217,11 @@ def diffuse_chunk(
         `[1, block_size, latent_dim]` newly generated chunk in **normalized**
         space (caller denormalizes before feeding to the codec).
     """
+    if solver not in SUPPORTED_RT_SOLVERS:
+        raise ValueError(
+            f"unknown solver: {solver!r} (expected one of {SUPPORTED_RT_SOLVERS})"
+        )
+
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
     B = prefix_norm.shape[0]
@@ -183,31 +238,105 @@ def diffuse_chunk(
 
     x = torch.cat([prefix_norm, target], dim=1)
     attn_mask = block_causal_mask(L, model.block_size, device=device).to(dtype)
+    is_target = torch.arange(L, device=device) >= P  # [L]
 
     def t_per_token(t_now: float) -> torch.Tensor:
         # Prefix kept clean (t=0); only the new chunk carries noise level t_now.
-        is_target = torch.arange(L, device=device) >= P
         return is_target.float().unsqueeze(0).expand(B, -1) * t_now
 
-    inv_temp = 1.0 / max(1e-6, float(temperature))
-    dt = 1.0 / n_steps
-    for k in range(n_steps):
-        t_now = 1.0 - k * dt
-        t_next = max(0.0, t_now - dt)
+    def velocity(state: torch.Tensor, t_now: float) -> torch.Tensor:
+        # Returns v over the full sequence; callers index target slice only.
+        if coreml_backend is not None and coreml_backend.is_using_coreml():
+            return coreml_backend(state, t_per_token(t_now), attn_mask=attn_mask)
+        return model(state, t_per_token(t_now), attn_mask=attn_mask)
 
-        if solver == "euler":
-            v = model(x, t_per_token(t_now), attn_mask=attn_mask)
-            x = x.clone()
-            x[:, P:] = x[:, P:] - dt * inv_temp * v[:, P:]
-        elif solver == "heun":
-            v1 = model(x, t_per_token(t_now), attn_mask=attn_mask)
-            x_pred = x.clone()
-            x_pred[:, P:] = x_pred[:, P:] - dt * inv_temp * v1[:, P:]
-            v2 = model(x_pred, t_per_token(t_next), attn_mask=attn_mask)
-            x = x.clone()
-            x[:, P:] = x[:, P:] - 0.5 * dt * inv_temp * (v1[:, P:] + v2[:, P:])
-        else:
-            raise ValueError(f"unknown solver: {solver!r} (expected 'euler' or 'heun')")
+    inv_temp = 1.0 / max(1e-6, float(temperature))
+    sched = _rt_build_schedule(n_steps, schedule, schedule_shift)
+
+    if solver in ("euler", "heun", "midpoint", "rk4"):
+        for k in range(n_steps):
+            t_now = sched[k]
+            t_next = sched[k + 1]
+            dt = t_next - t_now  # negative
+
+            if solver == "euler":
+                v = velocity(x, t_now)
+                x = _rt_apply_target(x, P, x[:, P:] + dt * inv_temp * v[:, P:])
+            elif solver == "heun":
+                v1 = velocity(x, t_now)
+                x_pred = _rt_apply_target(x, P, x[:, P:] + dt * inv_temp * v1[:, P:])
+                v2 = velocity(x_pred, t_next)
+                x = _rt_apply_target(
+                    x, P,
+                    x[:, P:] + 0.5 * dt * inv_temp * (v1[:, P:] + v2[:, P:]),
+                )
+            elif solver == "midpoint":
+                t_mid = t_now + 0.5 * dt
+                v1 = velocity(x, t_now)
+                x_mid = _rt_apply_target(x, P, x[:, P:] + 0.5 * dt * inv_temp * v1[:, P:])
+                v2 = velocity(x_mid, t_mid)
+                x = _rt_apply_target(x, P, x[:, P:] + dt * inv_temp * v2[:, P:])
+            else:  # rk4
+                t_mid = t_now + 0.5 * dt
+                v1 = velocity(x, t_now)
+                x2 = _rt_apply_target(x, P, x[:, P:] + 0.5 * dt * inv_temp * v1[:, P:])
+                v2 = velocity(x2, t_mid)
+                x3 = _rt_apply_target(x, P, x[:, P:] + 0.5 * dt * inv_temp * v2[:, P:])
+                v3 = velocity(x3, t_mid)
+                x4 = _rt_apply_target(x, P, x[:, P:] + dt * inv_temp * v3[:, P:])
+                t_eval = max(t_next, 1e-5)
+                v4 = velocity(x4, t_eval)
+                upd = (dt / 6.0) * inv_temp * (
+                    v1[:, P:] + 2.0 * v2[:, P:] + 2.0 * v3[:, P:] + v4[:, P:]
+                )
+                x = _rt_apply_target(x, P, x[:, P:] + upd)
+
+    elif solver == "dpmpp":
+        # DPM-Solver++ 2M for rectified flow. Temperature scales the velocity
+        # that forms the `denoised` (x_data) prediction.
+        eps = 1e-10
+        old_denoised = None
+        log_snr = lambda t: math.log(max(1.0 - t, eps) / max(t, eps))
+        for k in range(n_steps):
+            t_now = sched[k]
+            t_next = sched[k + 1]
+            t_prev = sched[k - 1] if k > 0 else None
+
+            v = velocity(x, t_now)
+            denoised = x[:, P:] - t_now * inv_temp * v[:, P:]
+            alpha_t = 1.0 - t_next
+            denom = max(1.0 - t_next, eps) * max(t_now, eps)
+            dpmpp_coeff = (t_next - t_now) / denom
+
+            if (old_denoised is None) or (t_next == 0.0):
+                denoised_use = denoised
+            else:
+                h = log_snr(t_next) - log_snr(t_now)
+                h_last = log_snr(t_now) - log_snr(t_prev)  # type: ignore[arg-type]
+                r = (h_last / h) if h != 0.0 else 0.0
+                if r == 0.0:
+                    denoised_use = denoised
+                else:
+                    denoised_use = (1.0 + 1.0 / (2.0 * r)) * denoised - (1.0 / (2.0 * r)) * old_denoised
+
+            scale = t_next / max(t_now, eps)
+            target_new = scale * x[:, P:] - alpha_t * dpmpp_coeff * denoised_use
+            x = _rt_apply_target(x, P, target_new)
+            old_denoised = denoised
+
+    elif solver == "pingpong":
+        # Stochastic SDE sampler: denoise -> re-noise to the next noise level.
+        for k in range(n_steps):
+            t_now = sched[k]
+            t_next = sched[k + 1]
+            v = velocity(x, t_now)
+            denoised = x[:, P:] - t_now * inv_temp * v[:, P:]
+            if t_next > 0.0:
+                new_noise = torch.randn_like(denoised)
+                target_new = (1.0 - t_next) * denoised + t_next * new_noise
+            else:
+                target_new = denoised
+            x = _rt_apply_target(x, P, target_new)
 
     return x[:, P:]
 
@@ -617,16 +746,40 @@ class RealtimeFlowGenerator:
         prebuffer_chunks: int = 2,
         crossfade_chunks: int = 4,
         initial_seed: Optional[int] = None,
+        coreml_path: Optional[str] = None,
     ):
         self.model = model
         self.codec = codec
         self.device = device
         self.dtype = next(model.parameters()).dtype
+        
+        # Optional CoreML backend with fallback
+        self.coreml_backend = None
+        self.use_coreml = False
+        if coreml_path and COREML_AVAILABLE:
+            try:
+                self.coreml_backend = CoreMLBackend(
+                    coreml_path=coreml_path,
+                    pytorch_model=model,
+                    device=device,
+                )
+                self.use_coreml = self.coreml_backend.is_using_coreml()
+                if self.use_coreml:
+                    logger.info("Using CoreML backend for inference")
+            except Exception as e:
+                logger.warning("Failed to initialize CoreML backend: %s", e)
+                logger.info("Falling back to PyTorch MPS backend")
 
         self.n_steps = int(n_steps)
         self.solver = str(solver)
         self.temperature = float(temperature)
         self.seed_scale = float(seed_scale)
+        # Time-grid warp (matches `flow.model.cfm`):
+        #   - "linear"  : uniform t grid from 1 -> 0
+        #   - "shifted" : SD3-style logSNR shift; `schedule_shift > 0` allocates
+        #     more steps near t=1 (better for low NFE / long sequences).
+        self.schedule: str = "linear"
+        self.schedule_shift: float = 0.0
 
         # Context (sliding window) sizing -- in chunks, converted to tokens
         # via model.block_size. The hard ceiling is `max_seq_len // block_size
@@ -1004,6 +1157,9 @@ class RealtimeFlowGenerator:
             solver=self.solver,
             temperature=self.temperature,
             init_noise=init,
+            schedule=self.schedule,
+            schedule_shift=self.schedule_shift,
+            coreml_backend=self.coreml_backend,
         )
         if not torch.isfinite(chunk).all():
             self._nan_recoveries += 1
@@ -1019,6 +1175,9 @@ class RealtimeFlowGenerator:
                 solver=self.solver,
                 temperature=self.temperature,
                 init_noise=None,
+                schedule=self.schedule,
+                schedule_shift=self.schedule_shift,
+                coreml_backend=self.coreml_backend,
             )
             if not torch.isfinite(chunk).all():
                 logger.error("non-finite chunk persisted after reset; substituting zeros")
@@ -1366,12 +1525,18 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--ckpt", required=True, help="Path to last.pt or ema.pt produced by training.")
     p.add_argument("--use-ema", action="store_true",
                    help="Load EMA weights from the checkpoint (recommended for inference).")
+    p.add_argument("--coreml-path", default=None,
+                   help="Path to CoreML model (.mlpackage) for inference. "
+                        "If provided, uses CoreML backend with fallback to PyTorch. "
+                        "Requires coremltools to be installed.")
 
     # Diffusion / sampler
     p.add_argument("--nfe", type=int, default=4, dest="n_steps",
                    help="Number of ODE steps per chunk.")
-    p.add_argument("--solver", default="euler", choices=["euler", "heun"],
-                   help="ODE solver. heun is 2x more accurate but 2x slower.")
+    p.add_argument("--solver", default="euler",
+                   choices=list(SUPPORTED_RT_SOLVERS),
+                   help="Sampler: euler/heun/midpoint/rk4 (ODE), "
+                        "dpmpp (DPM-Solver++ 2M for RF), pingpong (SDE).")
     p.add_argument("--temperature", type=float, default=1.0,
                    help="Velocity scaling. <1 sharpens, >1 diffuses.")
     p.add_argument("--seed-scale", type=float, default=0.0,
@@ -1445,6 +1610,7 @@ def main() -> None:
         prebuffer_chunks=args.prebuffer,
         crossfade_chunks=args.crossfade_chunks,
         initial_seed=args.seed,
+        coreml_path=args.coreml_path,
     )
 
     # Apply optional initial summary-latent controls from CLI.

@@ -87,6 +87,16 @@ Examples:
     sample_parser.add_argument("--device", default="mps", help="Device (mps, cuda, cpu)")
     sample_parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
     
+    # Convert to CoreML command
+    coreml_parser = subparsers.add_parser("convert-coreml", help="Convert a checkpoint to CoreML format")
+    coreml_parser.add_argument("--ckpt", required=True, help="Checkpoint path (.pt)")
+    coreml_parser.add_argument("--out", required=True, help="Output CoreML model path (.mlpackage)")
+    coreml_parser.add_argument("--use-ema", action="store_true", default=True, help="Use EMA weights (default: True)")
+    coreml_parser.add_argument("--context-chunks", type=int, default=32, help="Number of context chunks for tracing (default: 32)")
+    coreml_parser.add_argument("--min-deployment-target", default="macos13", 
+                               choices=["macos13", "ios16", "ios17", "macos14"],
+                               help="Minimum deployment target (default: macos13)")
+    
     args = parser.parse_args()
     
     if args.command == "preprocess":
@@ -184,6 +194,21 @@ Examples:
             sample_args.extend(["--prompt-wav", args.prompt_wav])
         sys.argv = sample_args
         flow.sample.main()
+    elif args.command == "convert-coreml":
+        import flow.coreml_utils
+        success = flow.coreml_utils.convert_checkpoint_to_coreml(
+            ckpt_path=args.ckpt,
+            output_path=args.out,
+            use_ema=args.use_ema,
+            context_chunks=args.context_chunks,
+            min_deployment_target=args.min_deployment_target,
+        )
+        if success:
+            print(f"Successfully converted {args.ckpt} to CoreML format: {args.out}")
+            sys.exit(0)
+        else:
+            print(f"Failed to convert {args.ckpt} to CoreML format")
+            sys.exit(1)
     else:
         parser.print_help()
         sys.exit(1)

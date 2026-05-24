@@ -447,6 +447,23 @@ def _list_output_devices() -> "list[Dict[str, Any]]":
     return out
 
 
+def _device_supports_stereo_output(idx: Optional[int]) -> bool:
+    """Return True iff the given sounddevice index has >= 2 output channels.
+
+    `None` (system default) is always considered acceptable: the OS will pick
+    a sensible output. `sd` being unavailable counts as "unknown -> accept".
+    """
+    if idx is None:
+        return True
+    if sd is None:
+        return True
+    try:
+        info = sd.query_devices(int(idx))
+        return int(info.get("max_output_channels", 0)) >= 2
+    except Exception:
+        return False
+
+
 def _resolve_output_device(spec: Optional[Any]) -> Optional[int]:
     """Resolve a user-supplied output-device spec to a concrete int index.
 
@@ -458,33 +475,49 @@ def _resolve_output_device(spec: Optional[Any]) -> Optional[int]:
                                   (case-insensitive)
 
     Returns the chosen device index, or None to mean "use the system default".
-    On any failure to match, falls back to None and logs a warning to stderr.
+    On any failure to match, OR if the resolved device cannot do stereo
+    output, falls back to None and logs a warning to stderr. This prevents
+    a stale saved preference (e.g. an unplugged interface) from crashing
+    the engine at startup with `PaErrorCode -9998`.
     """
     if spec is None:
         return None
+
+    resolved: Optional[int] = None
     if isinstance(spec, int):
-        return int(spec)
-    if isinstance(spec, str):
+        resolved = int(spec)
+    elif isinstance(spec, str):
         s = spec.strip()
         if not s or s.lower() == "default":
             return None
         try:
-            return int(s)
+            resolved = int(s)
         except ValueError:
-            pass
-        if sd is None:
-            return None
-        try:
-            needle = s.lower()
-            for i, d in enumerate(sd.query_devices()):
-                if int(d.get("max_output_channels", 0)) <= 0:
-                    continue
-                if needle in str(d.get("name", "")).lower():
-                    return int(i)
-        except Exception:
-            pass
-        sys.stderr.write(f"[server] output-device '{spec}' not found, using default\n")
-    return None
+            resolved = None
+        if resolved is None:
+            if sd is None:
+                return None
+            try:
+                needle = s.lower()
+                for i, d in enumerate(sd.query_devices()):
+                    if int(d.get("max_output_channels", 0)) <= 0:
+                        continue
+                    if needle in str(d.get("name", "")).lower():
+                        resolved = int(i)
+                        break
+            except Exception:
+                pass
+            if resolved is None:
+                sys.stderr.write(f"[server] output-device '{spec}' not found, using default\n")
+                return None
+
+    if resolved is not None and not _device_supports_stereo_output(resolved):
+        sys.stderr.write(
+            f"[server] output-device {resolved!r} does not support stereo output, "
+            f"using system default\n"
+        )
+        return None
+    return resolved
 
 
 # --------------------------------------------------------------------------- #
@@ -635,8 +668,14 @@ class ServerApp:
                 self._base_n_steps = max(1, int(val))
             elif name == "solver":
                 solver = str(val).lower()
-                if solver in ("euler", "heun"):
+                if solver in ("euler", "heun", "midpoint", "rk4", "dpmpp", "pingpong"):
                     gen.solver = solver  # not LFO'd
+            elif name == "schedule":
+                sched = str(val).lower()
+                if sched in ("linear", "shifted"):
+                    gen.schedule = sched
+            elif name == "schedule_shift":
+                gen.schedule_shift = float(val)
             elif name == "context_chunks":
                 self._base_context_chunks = max(0, min(int(val), gen.max_context_chunks))
                 gen.set_context_chunks(self._base_context_chunks)
@@ -792,7 +831,7 @@ class ServerApp:
                 self._base_n_steps = max(1, int(p["n_steps"]))
             if "solver" in p:
                 solver = str(p["solver"]).lower()
-                if solver in ("euler", "heun"):
+                if solver in ("euler", "heun", "midpoint", "rk4", "dpmpp", "pingpong"):
                     gen.solver = solver
             if "context_chunks" in p:
                 v = max(0, min(int(p["context_chunks"]), gen.max_context_chunks))
@@ -950,6 +989,8 @@ class ServerApp:
                 "temperature": self._base_temperature,
                 "n_steps": self._base_n_steps,
                 "solver": gen.solver,
+                "schedule": getattr(gen, "schedule", "linear"),
+                "schedule_shift": float(getattr(gen, "schedule_shift", 0.0)),
                 "context_chunks": self._base_context_chunks,
                 "crossfade_chunks": self._base_crossfade_chunks,
                 "seed": int(gen.current_seed) if gen.current_seed is not None else None,
@@ -1012,16 +1053,40 @@ class ServerApp:
         wf_thread = threading.Thread(target=self._waveform_pusher_loop, daemon=True)
         wf_thread.start()
 
+        def _open_output_stream():
+            """Open the audio output stream, falling back to system default if
+            the configured device fails (e.g. wrong channel count, samplerate,
+            unplugged interface). Returns the open OutputStream context."""
+            try:
+                return sd.OutputStream(
+                    samplerate=gen.sample_rate,
+                    channels=2,
+                    dtype="float32",
+                    blocksize=2048,
+                    callback=_callback,
+                    latency="low",
+                    device=self._output_device,
+                )
+            except Exception as e:
+                if self._output_device is None:
+                    raise
+                sys.stderr.write(
+                    f"[server] failed to open output device {self._output_device!r}: {e}; "
+                    f"falling back to system default\n"
+                )
+                self._output_device = None
+                return sd.OutputStream(
+                    samplerate=gen.sample_rate,
+                    channels=2,
+                    dtype="float32",
+                    blocksize=2048,
+                    callback=_callback,
+                    latency="low",
+                    device=None,
+                )
+
         try:
-            with sd.OutputStream(
-                samplerate=gen.sample_rate,
-                channels=2,
-                dtype="float32",
-                blocksize=2048,
-                callback=_callback,
-                latency="low",
-                device=self._output_device,
-            ):
+            with _open_output_stream():
                 while not self._stop_flag.is_set():
                     self._drain_commands()
 
@@ -1139,6 +1204,8 @@ class ServerApp:
                 "temperature": float(gen.temperature),
                 "n_steps": int(gen.n_steps),
                 "solver": gen.solver,
+                "schedule": getattr(gen, "schedule", "linear"),
+                "schedule_shift": float(getattr(gen, "schedule_shift", 0.0)),
                 "context_chunks": int(gen.context_chunks),
                 "crossfade_chunks": int(gen.crossfade_chunks),
             },
@@ -1176,7 +1243,7 @@ def _build_argparser() -> argparse.ArgumentParser:
                    help="sounddevice output device (int index or name substring). "
                         "Defaults to the system default output.")
     p.add_argument("--nfe", type=int, default=4, dest="n_steps")
-    p.add_argument("--solver", default="euler", choices=["euler", "heun"])
+    p.add_argument("--solver", default="euler", choices=["euler", "heun", "midpoint", "rk4", "dpmpp", "pingpong"])
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--seed-scale", type=float, default=0.0)
     p.add_argument("--context-chunks", type=int, default=32)
@@ -1185,6 +1252,9 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--max-chunks", type=int, default=None)
     p.add_argument("--save", type=str, default=None)
     p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--coreml-path", default=None,
+                   help="Path to CoreML model (.mlpackage) for inference. "
+                        "If provided, uses CoreML backend with fallback to PyTorch.")
     return p
 
 
@@ -1214,6 +1284,7 @@ def main() -> None:
         prebuffer_chunks=args.prebuffer,
         crossfade_chunks=args.crossfade_chunks,
         initial_seed=args.seed,
+        coreml_path=args.coreml_path,
     )
 
     app = ServerApp(gen, max_chunks=args.max_chunks, save_path=args.save,

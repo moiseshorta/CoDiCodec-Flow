@@ -263,6 +263,7 @@ def launch_tui_train(
     n_layers: Optional[int] = None,
     n_heads: Optional[int] = None,
     cond_dim: Optional[int] = None,
+    init_from: Optional[str] = None,
 ) -> None:
     """Launch training with TUI monitoring."""
     # Build training arguments
@@ -301,6 +302,8 @@ def launch_tui_train(
         args.extend(["--n-heads", str(n_heads)])
     if cond_dim:
         args.extend(["--cond-dim", str(cond_dim)])
+    if init_from:
+        args.extend(["--init-from", init_from])
     
     # Create monitor and start training
     monitor = TrainingMonitor(out_dir, max_steps=max_steps)

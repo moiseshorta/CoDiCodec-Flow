@@ -16,7 +16,14 @@ import numpy as np
 import torch
 
 from .config import Config
-from .model.cfm import cfm_loss, sample, sample_logit_normal, sample_prefix_chunks
+from .model.cfm import (
+    SUPPORTED_SCHEDULES,
+    SUPPORTED_SOLVERS,
+    cfm_loss,
+    sample,
+    sample_logit_normal,
+    sample_prefix_chunks,
+)
 from .model.dit import FlowDiT
 from .train import build_model
 from .utils import block_causal_mask, best_device, count_params, get_logger, human_int, set_seed
@@ -60,13 +67,29 @@ def smoke_model(device: torch.device) -> None:
     dt_train = time.time() - t0
     logger.info("forward+backward OK in %.3fs, loss=%.4f", dt_train, loss_val)
 
-    # Sampling
+    # Sampling: exercise every supported solver + schedule combo.
     model.eval()
     prefix = torch.randn(1, 16, D, device=device)
-    t0 = time.time()
-    full = sample(model, prefix=prefix, n_target_tokens=24, n_steps=4, solver="heun")
-    dt_samp = time.time() - t0
-    logger.info("sampled (Heun, 4 NFE) shape=%s in %.3fs", tuple(full.shape), dt_samp)
+    for solver in SUPPORTED_SOLVERS:
+        t0 = time.time()
+        full = sample(model, prefix=prefix, n_target_tokens=24, n_steps=4, solver=solver)
+        dt_samp = time.time() - t0
+        assert full.shape == (1, 40, D), f"{solver}: bad shape {full.shape}"
+        assert torch.isfinite(full).all(), f"{solver}: non-finite outputs"
+        logger.info("sampled (%-9s 4 NFE) shape=%s in %.3fs", solver + ",", tuple(full.shape), dt_samp)
+
+    # Schedule shift smoke test (logSNR-shifted grid).
+    full_shift = sample(
+        model,
+        prefix=prefix,
+        n_target_tokens=24,
+        n_steps=4,
+        solver="heun",
+        schedule="shifted",
+        schedule_shift=1.0,
+    )
+    assert torch.isfinite(full_shift).all()
+    logger.info("sampled (heun, shifted schedule) shape=%s", tuple(full_shift.shape))
 
 
 def smoke_codec(device: torch.device) -> None:

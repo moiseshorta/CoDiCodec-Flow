@@ -653,7 +653,8 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--audio-prompt-seconds", type=float, default=None)
     p.add_argument("--audio-continuation-seconds", type=float, default=None)
     p.add_argument("--audio-nfe", type=int, default=None)
-    p.add_argument("--audio-solver", default=None, choices=["euler", "heun"])
+    p.add_argument("--audio-solver", default=None,
+                   choices=["euler", "heun", "midpoint", "rk4", "dpmpp", "pingpong"])
     p.add_argument("--audio-unconditional", dest="audio_unconditional", action="store_true", default=None,
                    help="Generate audio samples unconditionally from pure noise (default).")
     p.add_argument("--audio-continuation", dest="audio_unconditional", action="store_false",

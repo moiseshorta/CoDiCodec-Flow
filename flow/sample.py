@@ -35,7 +35,7 @@ from .config import (
     CFMConfig,
     ModelConfig,
 )
-from .model.cfm import sample as cfm_sample
+from .model.cfm import SUPPORTED_SCHEDULES, SUPPORTED_SOLVERS, sample as cfm_sample
 from .model.dit import FlowDiT
 from .model.ema import EMA
 from .utils import best_device, get_logger
@@ -83,8 +83,14 @@ def main() -> None:
     p.add_argument("--prompt-wav", default=None, help="Optional prompt audio (any sr, stereo or mono).")
     p.add_argument("--duration-s", type=float, default=20.0,
                    help="Duration of the *generated continuation* in seconds (excludes prompt).")
-    p.add_argument("--nfe", type=int, default=8, help="Number of ODE steps.")
-    p.add_argument("--solver", default="heun", choices=["euler", "heun"])
+    p.add_argument("--nfe", type=int, default=8, help="Number of ODE/SDE steps.")
+    p.add_argument("--solver", default="heun", choices=list(SUPPORTED_SOLVERS),
+                   help="Sampler: euler/heun/midpoint/rk4 (deterministic ODE), "
+                        "dpmpp (DPM-Solver++ 2M for RF), pingpong (stochastic SDE).")
+    p.add_argument("--schedule", default="linear", choices=list(SUPPORTED_SCHEDULES),
+                   help="Time grid: 'linear' (default) or 'shifted' (logSNR shift).")
+    p.add_argument("--schedule-shift", type=float, default=0.0,
+                   help="LogSNR shift exponent for --schedule shifted (e.g. 1.0-3.0 for long sequences).")
     p.add_argument("--out", required=True, help="Output .wav path.")
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=0)
@@ -142,6 +148,8 @@ def main() -> None:
         n_target_tokens=n_target_tokens,
         n_steps=args.nfe,
         solver=args.solver,
+        schedule=args.schedule,
+        schedule_shift=args.schedule_shift,
     )  # [1, P + n_target, 64]
 
     # Decode through the codec.

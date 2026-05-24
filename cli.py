@@ -57,7 +57,9 @@ Examples:
     train_parser.add_argument("--audio-prompt-seconds", type=float, default=4, help="Audio prompt duration in seconds")
     train_parser.add_argument("--audio-continuation-seconds", type=float, default=8, help="Audio continuation duration in seconds")
     train_parser.add_argument("--audio-nfe", type=int, default=16, help="Audio sampling NFE")
-    train_parser.add_argument("--audio-solver", default="heun", help="Audio sampling solver (euler, heun)")
+    train_parser.add_argument("--audio-solver", default="heun",
+                              choices=["euler", "heun", "midpoint", "rk4", "dpmpp", "pingpong"],
+                              help="Audio sampling solver during training")
     train_parser.add_argument("--audio-unconditional", action="store_true", help="Generate unconditional audio samples")
     train_parser.add_argument("--t-sample-mode", default="uniform", help="Time sampling mode (uniform, importance)")
     train_parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
@@ -65,6 +67,7 @@ Examples:
     train_parser.add_argument("--n-layers", type=int, default=None, help="Number of layers")
     train_parser.add_argument("--n-heads", type=int, default=None, help="Number of heads")
     train_parser.add_argument("--cond-dim", type=int, default=None, help="Conditioning dimension")
+    train_parser.add_argument("--init-from", default=None, help="Path to checkpoint to initialize from (for fine-tuning)")
     train_parser.add_argument("--no-tui", action="store_true", help="Disable TUI for monitoring training")
     
     # Sample command
@@ -73,7 +76,13 @@ Examples:
     sample_parser.add_argument("--prompt-wav", help="Prompt audio file")
     sample_parser.add_argument("--duration-s", type=float, default=20, help="Duration in seconds")
     sample_parser.add_argument("--nfe", type=int, default=8, help="Number of function evaluations")
-    sample_parser.add_argument("--solver", default="heun", help="Solver (euler, heun)")
+    sample_parser.add_argument("--solver", default="heun",
+                               choices=["euler", "heun", "midpoint", "rk4", "dpmpp", "pingpong"],
+                               help="Solver: euler/heun/midpoint/rk4 (ODE), dpmpp (DPM-Solver++ 2M for RF), pingpong (SDE)")
+    sample_parser.add_argument("--schedule", default="linear", choices=["linear", "shifted"],
+                               help="Time grid: linear or logSNR-shifted")
+    sample_parser.add_argument("--schedule-shift", type=float, default=0.0,
+                               help="LogSNR shift exponent for --schedule shifted")
     sample_parser.add_argument("--out", required=True, help="Output audio file")
     sample_parser.add_argument("--device", default="mps", help="Device (mps, cuda, cpu)")
     sample_parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
@@ -115,6 +124,7 @@ Examples:
                 n_layers=args.n_layers,
                 n_heads=args.n_heads,
                 cond_dim=args.cond_dim,
+                init_from=args.init_from,
             )
         else:
             import flow.train
@@ -143,6 +153,8 @@ Examples:
                 "--t-sample-mode", args.t_sample_mode,
                 "--dropout", str(args.dropout),
             ]
+            if args.init_from:
+                train_args.extend(["--init-from", args.init_from])
             if args.audio_unconditional:
                 train_args.append("--audio-unconditional")
             if args.dim:
@@ -164,7 +176,8 @@ Examples:
             "--device", args.device,
             "--nfe", str(args.nfe),
             "--solver", args.solver,
-            "--temperature", str(args.temperature),
+            "--schedule", args.schedule,
+            "--schedule-shift", str(args.schedule_shift),
             "--duration-s", str(args.duration_s),
         ]
         if args.prompt_wav:

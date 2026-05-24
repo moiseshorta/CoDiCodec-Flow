@@ -198,7 +198,15 @@ python cli.py sample \
 - `--prompt-wav`: Audio prompt file (WAV, 48 kHz stereo recommended)
 - `--duration-s`: Duration of continuation in seconds (default: 20)
 - `--nfe`: Number of function evaluations (sampling steps, default: 8)
-- `--solver`: ODE solver: `euler` (faster) or `heun` (better quality)
+- `--solver`: Sampler (default `heun`). Supported:
+  - `euler`    : 1st-order ODE, 1 NFE/step (fastest baseline)
+  - `heun`     : 2nd-order ODE, 2 NFE/step (default)
+  - `midpoint` : 2nd-order RK2, 2 NFE/step
+  - `rk4`      : 4th-order Runge-Kutta, 4 NFE/step (highest quality at low NFE)
+  - `dpmpp`    : DPM-Solver++ 2M for rectified flow, 1 NFE/step (strong at NFE 4-8)
+  - `pingpong` : stochastic SDE sampler, 1 NFE/step (recommended for distilled / few-step models)
+- `--schedule`: Time grid: `linear` (default) or `shifted` (logSNR shift)
+- `--schedule-shift`: LogSNR shift exponent for `--schedule shifted` (e.g. `1.0`-`3.0` for long sequences)
 - `--out`: Output audio file path
 - `--device`: `mps`, `cuda`, or `cpu`
 - `--temperature`: Sampling temperature (default: 1.0, higher = more diverse)
@@ -235,9 +243,20 @@ python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duratio
 python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duration-s 20 --nfe 8 --solver heun --temperature 1.5 --out ./out_diverse.wav --device mps
 ```
 
+**DPM-Solver++ for very low NFE:**
+```bash
+python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duration-s 20 --nfe 6 --solver dpmpp --out ./out_dpmpp.wav --device mps
+```
+
+**RK4 for highest quality at low NFE:**
+```bash
+python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duration-s 20 --nfe 4 --solver rk4 --out ./out_rk4.wav --device mps
+```
+
 **Sampling Trade-offs:**
 - **NFE (steps)**: More steps = better quality but slower. 4-8 is real-time, 16+ is high quality.
-- **Solver**: Heun is more accurate than Euler but ~2x slower.
+- **Solver**: `euler`/`dpmpp`/`pingpong` use 1 NFE per step; `heun`/`midpoint` use 2; `rk4` uses 4. `dpmpp` and `rk4` give the best quality at very low total NFE; `pingpong` adds stochasticity (only recommended for distilled models).
+- **Schedule**: `--schedule shifted --schedule-shift 1.0` warps the time grid in log-SNR space (SD3-style); helpful for long sequences or low NFE.
 - **Temperature**: Higher values increase diversity but may reduce coherence.
 
 ## Audio Examples

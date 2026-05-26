@@ -62,6 +62,3 @@ runs/
 
 # Temporary files
 *.tmp
-
-# Build script (keep this)
-!build_macapp.sh

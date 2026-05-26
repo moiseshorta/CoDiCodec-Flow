@@ -268,10 +268,9 @@ python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duratio
 
 The `realtime` subcommand spins up a streaming generator that **plays audio
 indefinitely** out of the system's default sound device while the FlowDiT
-model continually fills a sliding-window buffer in the background. It is the
-same engine used by the Electron GUI, exposed as a standalone interactive
-terminal app. Use it for headless live-coding sessions, long-form ambient
-playback, or stress-testing a checkpoint.
+model continually fills a sliding-window buffer in the background. Use it for
+headless live-coding sessions, long-form ambient playback, or stress-testing a
+checkpoint.
 
 ### Quick start
 
@@ -444,7 +443,6 @@ python cli.py convert-coreml \
 - Realtime audio generation uses variable sequence lengths (sliding window), which CoreML does not support natively. The CoreML backend will automatically fall back to PyTorch MPS when shapes don't match.
 - For this reason, **CoreML is not recommended for realtime generation**. It may be useful for:
   - Batch inference with fixed shapes
-  - iOS/macOS app deployment where battery efficiency is critical
   - Experimentation and performance comparison
 
 ### Using CoreML for Inference
@@ -462,18 +460,6 @@ python -m flow.realtime \
 ```
 
 If CoreML inference fails (e.g., due to shape mismatch), the system automatically falls back to PyTorch MPS backend.
-
-### Using CoreML in the GUI App
-
-The macOS GUI app includes a CoreML toggle in the HUD header:
-
-1. Convert your checkpoint to CoreML format (see above)
-2. Launch the GUI app
-3. Click the COREML toggle in the top-right HUD
-4. The app will automatically derive the CoreML path from the selected model (replaces `.pt` with `.mlpackage`)
-5. Click RESTART to apply the CoreML backend
-
-The CoreML preference is saved and persists across app restarts. If CoreML inference fails, it automatically falls back to PyTorch MPS.
 
 ### Performance Considerations
 

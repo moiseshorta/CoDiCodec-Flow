@@ -399,6 +399,9 @@ time. Press `?` at any moment to print the up-to-date help in the terminal.
   after that, generation runs in lockstep with playback. If your machine
   generates faster than real-time, the engine throttles to avoid growing the
   buffer unbounded; if it's slower, you'll see underruns logged.
+- Each chunk prints an **RT %** metric: `audio_seconds / compute_seconds × 100`.
+  Values **> 100%** mean the model is generating faster than real-time (good),
+  values **< 100%** mean it can't keep up and you'll eventually hit underruns.
 - Seed switching is **crossfaded** in latent space across `--crossfade-chunks`
   chunks so transitions don't click.
 

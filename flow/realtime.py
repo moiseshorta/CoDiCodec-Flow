@@ -1416,14 +1416,16 @@ class RealtimeFlowGenerator:
 
                     chunk_secs = len(audio) / self.sample_rate
                     total_t = t_gen + t_dec
-                    rtf = total_t / chunk_secs if chunk_secs > 0 else float("inf")
-                    tag = "RT" if rtf < 1.0 else "SLOW"
+                    # RT speed = audio_time / compute_time, expressed as %.
+                    # >100% = faster than real-time (good), <100% = slower (bad).
+                    rt_speed = (chunk_secs / total_t * 100.0) if total_t > 0 else float("inf")
+                    tag = "RT" if rt_speed >= 100.0 else "SLOW"
                     sum_marker = "on" if self._summary_active() else "-"
                     ch_marker = "on" if self._channel_active() else "-"
                     print(
                         f"  Chunk {chunks_done:4d} | gen {t_gen*1000:5.0f}ms + "
                         f"dec {t_dec*1000:5.0f}ms = {total_t*1000:5.0f}ms | "
-                        f"audio {chunk_secs:.2f}s | RTF {rtf:.2f}x [{tag}] | "
+                        f"audio {chunk_secs:.2f}s | RT {rt_speed:5.1f}% [{tag}] | "
                         f"buf {buf_s:4.1f}s | underruns {self.audio_buffer.underruns} | "
                         f"steps={self.n_steps} solver={self.solver} ctx={self.context_chunks}ch "
                         f"seed={self.current_seed} temp={self.temperature:.2f} "
@@ -1495,7 +1497,9 @@ class RealtimeFlowGenerator:
         avg_dec = float(np.mean(self.decode_times)) * 1000.0
         total_audio = self.total_audio_samples / self.sample_rate
         total_compute = self.total_compute_time
-        rtf = total_compute / total_audio if total_audio > 0 else float("inf")
+        # RT speed = total_audio / total_compute, expressed as %.
+        # >100% = faster than real-time (good), <100% = slower (bad).
+        rt_speed = (total_audio / total_compute * 100.0) if total_compute > 0 else float("inf")
         bar = "=" * 60
         print(f"\n{bar}")
         print("  Session Summary")
@@ -1503,8 +1507,8 @@ class RealtimeFlowGenerator:
         print(f"  Chunks         : {self.chunk_count}")
         print(f"  Total audio    : {total_audio:.1f}s")
         print(f"  Total compute  : {total_compute:.1f}s")
-        rt_label = "real-time" if rtf < 1.0 else "slower than real-time"
-        print(f"  Overall RTF    : {rtf:.2f}x ({rt_label})")
+        rt_label = "faster than real-time" if rt_speed >= 100.0 else "slower than real-time"
+        print(f"  Overall RT speed: {rt_speed:.1f}% ({rt_label})")
         print(f"  Avg gen/chunk  : {avg_gen:.0f}ms")
         print(f"  Avg dec/chunk  : {avg_dec:.0f}ms")
         print(f"  Underruns      : {self.audio_buffer.underruns}")

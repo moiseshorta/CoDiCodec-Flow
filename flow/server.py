@@ -1149,7 +1149,9 @@ class ServerApp:
         gen = self.gen
         chunk_secs = audio_len / gen.sample_rate
         total_t = t_gen + t_dec
-        rtf = total_t / chunk_secs if chunk_secs > 0 else float("inf")
+        # RT speed = audio_time / compute_time as a percentage.
+        # >100% = faster than real-time (good), <100% = slower (bad).
+        rt_speed = (chunk_secs / total_t * 100.0) if total_t > 0 else float("inf")
 
         # Cheap audio peak (for a meter). Skip true RMS to keep cost trivial.
         # audio_buffer holds float32 stereo arrays already; we stat the just-
@@ -1187,7 +1189,7 @@ class ServerApp:
             "prebuffer": bool(prebuffer),
             "gen_ms": round(t_gen * 1000.0, 1),
             "dec_ms": round(t_dec * 1000.0, 1),
-            "rtf": round(rtf, 3),
+            "rt_speed": round(rt_speed, 1),
             "buf_s": round(buf_s if buf_s is not None
                            else gen.audio_buffer.buffered_samples / gen.sample_rate, 2),
             "underruns": int(gen.audio_buffer.underruns),

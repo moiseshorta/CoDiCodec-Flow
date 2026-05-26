@@ -94,7 +94,12 @@ python cli.py train --data-dir ./data/latents --out-dir ./runs/v0 --device mps
 
 # Generate audio
 python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --out ./out.wav --device mps
+
+# Stream audio indefinitely with live keyboard controls (press 'q' to quit)
+python cli.py realtime --ckpt ./runs/v0/ema.pt --use-ema --device mps
 ```
+
+See [Real-time Streaming Generation](#real-time-streaming-generation) for the full list of options and live keyboard controls.
 
 ## Preprocessing
 
@@ -258,6 +263,160 @@ python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duratio
 - **Solver**: `euler`/`dpmpp`/`pingpong` use 1 NFE per step; `heun`/`midpoint` use 2; `rk4` uses 4. `dpmpp` and `rk4` give the best quality at very low total NFE; `pingpong` adds stochasticity (only recommended for distilled models).
 - **Schedule**: `--schedule shifted --schedule-shift 1.0` warps the time grid in log-SNR space (SD3-style); helpful for long sequences or low NFE.
 - **Temperature**: Higher values increase diversity but may reduce coherence.
+
+## Real-time Streaming Generation
+
+The `realtime` subcommand spins up a streaming generator that **plays audio
+indefinitely** out of the system's default sound device while the FlowDiT
+model continually fills a sliding-window buffer in the background. It is the
+same engine used by the Electron GUI, exposed as a standalone interactive
+terminal app. Use it for headless live-coding sessions, long-form ambient
+playback, or stress-testing a checkpoint.
+
+### Quick start
+
+```bash
+# Minimal: stream from a checkpoint until you press 'q'
+python cli.py realtime --ckpt ./runs/v3_okachihuali/ema.pt --use-ema --device mps
+
+# Same thing, but called directly as a module
+python -m flow.realtime --ckpt ./runs/v3_okachihuali/ema.pt --use-ema --device mps
+```
+
+On launch you'll see the engine load the model, prebuffer a couple of chunks
+(~1.4 s @ 48 kHz), and then start playback. The terminal stays in raw mode so
+single keypresses act as live controls — there is no need to press Enter.
+
+### Common recipes
+
+```bash
+# High-quality, slightly slower (8 ODE steps with Heun integrator)
+python cli.py realtime --ckpt ./runs/v0/ema.pt --use-ema \
+    --solver heun --nfe 8 --temperature 0.95
+
+# Fast, low-NFE setup (good for live performance on a laptop)
+python cli.py realtime --ckpt ./runs/v0/ema.pt --use-ema \
+    --solver dpmpp --nfe 4
+
+# Long context window for more coherent long-form output
+python cli.py realtime --ckpt ./runs/v0/ema.pt --use-ema \
+    --context-chunks 64 --prebuffer 4 --crossfade-chunks 8
+
+# Capture the whole session to a WAV file while playing it live
+python cli.py realtime --ckpt ./runs/v0/ema.pt --use-ema \
+    --save ./session.wav
+
+# Reproducible session: fix the initial seed
+python cli.py realtime --ckpt ./runs/v0/ema.pt --use-ema --seed 12345
+
+# Stop automatically after 200 chunks (~137 s @ 48 kHz)
+python cli.py realtime --ckpt ./runs/v0/ema.pt --use-ema --max-chunks 200
+
+# Use a converted CoreML model (auto-falls back to PyTorch on shape mismatch)
+python cli.py realtime --ckpt ./runs/v0/ema.pt --use-ema \
+    --coreml-path ./runs/v0/model.mlpackage
+```
+
+### CLI options
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--ckpt PATH` | *required* | Checkpoint to load (`last.pt` or `ema.pt`). |
+| `--use-ema` | off | Load EMA weights — strongly recommended for inference. |
+| `--device DEV` | auto | `mps`, `cuda`, or `cpu`. Auto-detected if omitted. |
+| `--coreml-path PATH` | none | Optional CoreML `.mlpackage`. Falls back to PyTorch when the variable sliding-window shape does not match the traced shape. |
+| `--nfe N` | `4` | ODE steps per chunk. Higher = better quality, lower = lower latency. |
+| `--solver NAME` | `euler` | One of `euler`, `heun`, `midpoint`, `rk4`, `dpmpp`, `pingpong`. |
+| `--temperature F` | `1.0` | Velocity scaling. `<1` sharpens, `>1` diffuses. |
+| `--seed-scale F` | `0.0` | Shrinks initial noise toward zero (0 = standard `N(0, I)`). |
+| `--context-chunks N` | `32` | Sliding-window length in codec chunks (1 chunk ≈ 0.683 s @ 48 kHz). Pass `<= 0` to use the model's maximum safe context. |
+| `--prebuffer N` | `2` | Chunks to render before playback starts. Higher = more glitch-resistant, more startup latency. |
+| `--crossfade-chunks N` | `4` | Crossfade length used when switching seeds mid-stream. |
+| `--max-chunks N` | unbounded | Stop after `N` chunks. Omit for indefinite playback. |
+| `--save PATH` | none | Write the full session to a `.wav` file alongside live playback. |
+| `--seed N` | time-based | Initial RNG seed. |
+| `--summary-scale V` | `1.0` | Initial summary-latent scale. Scalar broadcasts to all 8 tokens; or pass 8 comma-separated floats (e.g. `1.0,0.9,1.1,...`). |
+| `--summary-bias V` | `0.0` | Same format as `--summary-scale`, added in normalized space. |
+
+### Live keyboard controls
+
+While the stream is playing, single keypresses adjust the engine in real
+time. Press `?` at any moment to print the up-to-date help in the terminal.
+
+**Global**
+
+| Key | Action |
+| --- | --- |
+| `q` | Quit. |
+| `?` | Print the full keyboard-control help. |
+| `r` | Reset everything to defaults (including summary & channel controls). |
+
+**Sampler**
+
+| Key | Action |
+| --- | --- |
+| `1` / `2` / `3` | Set diffusion steps to 4 / 8 / 16 NFE. |
+| `e` / `h` | Switch solver to `euler` / `heun`. |
+| `<` / `>` | Decrease / increase temperature by 0.1. |
+| `+` / `-` | Increase / decrease context window by 4 chunks. |
+
+**Seeds & morphing**
+
+| Key | Action |
+| --- | --- |
+| `x` | Crossfade to a new random seed. |
+| `X` | Hard cut to a new random seed. |
+| `s` / `S` | Crossfade / hard-cut to a specific seed (type the digits, then Enter). |
+| `a` | Toggle auto-cycle (periodically swap seeds). |
+| `A` | Set the auto-cycle interval in chunks. |
+| `[` / `]` | Decrease / increase crossfade length by 1 chunk. |
+
+**Summary-latent control** (per-chunk, 8 tokens)
+
+| Key | Action |
+| --- | --- |
+| `b` / `B` | Decrease / increase summary bias uniformly across all 8 tokens. |
+| `g` / `G` | Decrease / increase summary scale uniformly. |
+| `i` | Enter per-token edit mode (e.g. type `b3 0.5` to set bias of token 3). |
+| `o` | Reset summary controls only (`scale=1`, `bias=0`). |
+| `n` / `N` | Randomize summary bias / scale uniformly in their valid range. |
+| `m` | Randomize *both* summary scale and bias. |
+
+**Channel-latent control** (per-chunk, 64 feature dims)
+
+| Key | Action |
+| --- | --- |
+| `y` / `Y` | Randomize channel bias / scale (independent per dim). |
+| `u` | Randomize *both* channel scale and bias. |
+| `U` | Reset channel controls only. |
+
+### How it works (at a glance)
+
+- The model generates one **codec chunk** per inference call. Each chunk is
+  decoded to ~0.683 s of 48 kHz stereo audio.
+- A **sliding window** of the last `--context-chunks` chunks is fed back as
+  context, so the model has memory of recent material.
+- A **prebuffer** of `--prebuffer` chunks is rendered before audio starts;
+  after that, generation runs in lockstep with playback. If your machine
+  generates faster than real-time, the engine throttles to avoid growing the
+  buffer unbounded; if it's slower, you'll see underruns logged.
+- Seed switching is **crossfaded** in latent space across `--crossfade-chunks`
+  chunks so transitions don't click.
+
+### Tips & troubleshooting
+
+- **Audio underruns / glitches**: lower `--nfe`, switch to `--solver euler`,
+  reduce `--context-chunks`, or increase `--prebuffer`.
+- **Output sounds noisy or unstable**: try `--temperature 0.9` or lower, or
+  use `--solver heun --nfe 8` for higher-quality steps.
+- **Engine quits immediately with "checkpoint not found"**: pass an absolute
+  path to `--ckpt`, or run the command from the repo root.
+- **No sound**: confirm your default output device is correct
+  (the engine uses `sounddevice`'s default). On macOS, you can change the
+  default output in `System Settings > Sound`.
+- **CoreML keeps falling back to PyTorch**: this is expected — the traced
+  CoreML graph has a fixed shape, but realtime uses a variable sliding
+  window. CoreML is most useful for fixed-shape batch inference.
 
 ## CoreML Support
 

@@ -1,8 +1,10 @@
+import io
 import torch
 import numpy as np
 import soundfile as sf
 import torch.nn.functional as F
 import einops
+import pickle
 
 from .hparams import *
 from .hparams_inference import *
@@ -18,6 +20,30 @@ torch.backends.cuda.matmul.allow_tf32 = True
 if mixed_precision:
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
 
+
+class F16Unpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if module == 'numpy' and name == 'dtype':
+            orig = super().find_class(module, name)
+            return lambda *args, **kw: orig(
+                np.float16 if args and args[0] == 'f16' else args[0],
+                **kw
+            )
+        return super().find_class(module, name)
+
+def torch_load_with_f16(path, map_location=None):
+    with open(path, 'rb') as f:
+        buffer = io.BytesIO(f.read())
+
+    # Patch pickle to use our unpickler
+    original_unpickler = pickle.Unpickler
+    pickle.Unpickler = F16Unpickler
+    try:
+        checkpoint = torch.load(buffer, map_location=map_location, weights_only=False)
+    finally:
+        pickle.Unpickler = original_unpickler
+
+    return checkpoint
 
 class EncoderDecoder:
     """Codec wrapper for encoding waveforms to latents and decoding them back.
@@ -47,16 +73,17 @@ class EncoderDecoder:
         """Reshape latent channels to desired size while preserving content."""
         assert desired_channels%self.bottleneck_channels==0, f"Desired channels must be divisible by original number of channels = {self.bottleneck_channels}"
         return einops.rearrange(latents, '... (l d) c -> ... l (d c)', d=desired_channels//self.bottleneck_channels)
-    
+
     def dim2latents(self, latents):
         """Inverse of latents2dim()."""
         return einops.rearrange(latents, '... l (d c) -> ... (l d) c', c=self.bottleneck_channels)
-        
+
     def get_models(self):
         """Instantiate UNet and load weights from checkpoint."""
         gen = UNet().to(self.device)
         gen.eval()
-        checkpoint = torch.load(self.load_path_inference, map_location=self.device, weights_only=False)
+        #checkpoint = torch.load(self.load_path_inference, map_location=self.device, weights_only=False)
+        checkpoint = torch_load_with_f16(self.load_path_inference, map_location=self.device)
         gen.load_state_dict(checkpoint['gen_state_dict'], strict=True)
         self.gen = gen
 
@@ -82,7 +109,7 @@ class EncoderDecoder:
         # apply inverse tanh transform and rescale for continuous latents
         out = torch.atanh(out) / sigma_rescale
         return out
-    
+
     def decode(self, latent, mode='parallel', max_batch_size=None, denoising_steps=None, time_prompt=None, preprocess_on_gpu=True):
         '''
         latent: numpy array of latents to decode with shape [audio_channels, dim, length]
@@ -93,7 +120,7 @@ class EncoderDecoder:
         '''
         # if dtype of latents is int32 or int64, then set discrete to True
         discrete = is_integer(latent)
-        if max_batch_size is None: 
+        if max_batch_size is None:
             max_batch_size = max_batch_size_decode
         if discrete:
             latents = self.gen.fsq.indexes_to_codes(latent)
@@ -103,7 +130,7 @@ class EncoderDecoder:
             inv = torch.tanh(inv)
             latents = self.dim2latents(inv)
         return decode_latent_inference(latents, self, mode, max_batch_size, denoising_steps=denoising_steps, time_prompt=time_prompt, device=self.device, preprocess_on_gpu=preprocess_on_gpu)
-    
+
     def reset(self):
         """Clear internal live-decoding buffers."""
         self.past_spec = None
@@ -117,7 +144,7 @@ class EncoderDecoder:
 
         Returns numpy array of decoded waveform with shape [waveform_samples, audio_channels]
         '''
-        if max_batch_size is None: 
+        if max_batch_size is None:
             max_batch_size = max_batch_size_decode
         if discrete:
             latents = self.gen.fsq.indexes_to_codes(latents)
@@ -204,7 +231,7 @@ def encode_audio_inference(audio_path, trainer, max_batch_size_encode, device='c
         latent = latent[:original_batch_size]
     else:
         latent = distribute(trainer.gen.encoder_forward, repr_encoder, max_batch_size_encode, device, dont_quantize=dont_quantize)
-        
+
     del repr_encoder
     # split samples
     latent = torch.split(latent, batch_size, 0)

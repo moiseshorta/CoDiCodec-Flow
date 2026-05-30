@@ -5,5 +5,6 @@ soundfile
 huggingface_hub
 librosa
 tqdm
+pypickle
 # CoDiCodec is the upstream encoder/decoder. The local checkout is in ./codicodec.
 # Install it editable with: pip install -e ./codicodec

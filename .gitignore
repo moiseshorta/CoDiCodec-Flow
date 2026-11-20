@@ -49,6 +49,8 @@ Thumbs.db
 # Data and models
 data/
 runs/
+# ponytail: checkpoints exceed GitHub's 100 MB file limit; ship them as release assets
+weights/*.pt
 *.wav
 *.mp3
 *.flac

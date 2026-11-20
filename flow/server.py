@@ -1254,9 +1254,6 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--max-chunks", type=int, default=None)
     p.add_argument("--save", type=str, default=None)
     p.add_argument("--seed", type=int, default=None)
-    p.add_argument("--coreml-path", default=None,
-                   help="Path to CoreML model (.mlpackage) for inference. "
-                        "If provided, uses CoreML backend with fallback to PyTorch.")
     return p
 
 
@@ -1286,7 +1283,6 @@ def main() -> None:
         prebuffer_chunks=args.prebuffer,
         crossfade_chunks=args.crossfade_chunks,
         initial_seed=args.seed,
-        coreml_path=args.coreml_path,
     )
 
     app = ServerApp(gen, max_chunks=args.max_chunks, save_path=args.save,

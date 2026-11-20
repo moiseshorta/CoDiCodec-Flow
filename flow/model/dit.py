@@ -8,9 +8,9 @@ Attention is **block-causal**: full bidirectional attention within a block,
 strict causality across blocks. This matches the codec's chunk-causal
 decoder and lets us KV-cache one chunk at a time at inference.
 
-Time conditioning is **per-token**: this is essential because in a continuation
-training step the prefix tokens are clean (t=0) while the target tokens carry
-a noise level `t ∈ (0, 1]`. AdaLN-Zero modulation handles this cleanly.
+Time conditioning is **per-chunk**: clean context chunks sit at t=0 while the
+chunk being generated carries a noise level `t ∈ (0, 1]`. AdaLN-Zero modulation
+is computed once per chunk and broadcast over its tokens.
 
 Architectural choices follow recent SOTA continuous-token diffusion / flow
 matching models (DiT, SD3, Stable Audio 2):
@@ -21,8 +21,8 @@ matching models (DiT, SD3, Stable Audio 2):
 - **Rotary positional embeddings (RoPE)** on Q/K, with a factorized
   intra-chunk / inter-chunk frequency split so the model can distinguish
   within-block from across-block positions cleanly.
-- **Latent normalization** baked in as buffers: `cfm_loss` and `sample`
-  call `model.normalize` / `model.denormalize` so the network always sees
+- **Latent normalization** baked in as buffers: the losses and samplers in
+  `cfm.py` call `model.normalize` / `model.denormalize` so the network always sees
   a unit-Gaussian-distributed input regardless of the dataset's natural
   scale, and downloaded checkpoints are self-contained.
 - Optional residual dropout for regularization on small datasets.
@@ -96,13 +96,10 @@ class FactorizedRoPE(nn.Module):
         out = torch.stack((-x2, x1), dim=-1)
         return out.flatten(-2)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, H, N, head_dim]
-        n = x.shape[-2]
-        if n > self.cos.shape[0]:
-            raise ValueError(f"sequence length {n} exceeds RoPE max ({self.cos.shape[0]})")
-        cos = self.cos[:n].to(x.dtype)
-        sin = self.sin[:n].to(x.dtype)
+    def forward(self, x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        # x: [B, H, N, head_dim]; pos: [N] integer positions (< max_seq_len).
+        cos = self.cos[pos].to(x.dtype)
+        sin = self.sin[pos].to(x.dtype)
         return x * cos + self._rotate_half(x) * sin
 
 
@@ -192,8 +189,13 @@ class SelfAttention(nn.Module):
         self.rope = rope
         self.dropout = dropout
 
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        b, n, _ = x.shape
+    def forward(self, x: torch.Tensor, attn_mask=None, pos=None, kv=None):
+        """x: [B, ..., dim] (token axes are flattened here). `kv` holds cached (k, v) of
+        earlier tokens (a clean context) to attend to. Returns (out, (k, v) of x)."""
+        shape = x.shape
+        b = shape[0]
+        x = x.reshape(b, -1, shape[-1])
+        n = x.shape[1]
         qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
         # Reshape to [B, H, N, D]
@@ -204,16 +206,20 @@ class SelfAttention(nn.Module):
         k = self.k_norm(k)
         # Rotary embeddings (V is NOT rotated -- standard RoPE convention).
         if self.rope is not None:
-            q = self.rope(q)
-            k = self.rope(k)
+            q = self.rope(q, pos)
+            k = self.rope(k, pos)
+        new_kv = (k, v)
+        if kv is not None:
+            k = torch.cat([kv[0], k], dim=2)
+            v = torch.cat([kv[1], v], dim=2)
         out = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attn_mask,
             dropout_p=self.dropout if self.training else 0.0,
             is_causal=False,
         )
-        out = out.transpose(1, 2).contiguous().view(b, n, -1)
-        return self.out(out)
+        out = out.transpose(1, 2).reshape(shape)
+        return self.out(out), new_kv
 
 
 class SwiGLU(nn.Module):
@@ -241,12 +247,13 @@ class SwiGLU(nn.Module):
 # --------------------------------------------------------------------------- #
 
 class DiTBlock(nn.Module):
-    """DiT transformer block with AdaLN-Zero conditioning, per-token cond.
+    """DiT transformer block with AdaLN-Zero conditioning, per-chunk cond.
 
-    Conditioning is `[B, L, cond_dim]`; the block produces 6 modulation
-    parameters per token (scale_attn, shift_attn, gate_attn, scale_mlp,
-    shift_mlp, gate_mlp). All six are zero-initialized via the modulation
-    projection so the block starts as identity (gates = 0).
+    Tokens arrive as `[B, n_chunks, block_size, dim]` and conditioning as
+    `[B, n_chunks, 1, cond_dim]`; the block produces 6 modulation parameters per
+    chunk (scale_attn, shift_attn, gate_attn, scale_mlp, shift_mlp, gate_mlp),
+    broadcast over the chunk's tokens. All six are zero-initialized via the
+    modulation projection so the block starts as identity (gates = 0).
     """
 
     def __init__(
@@ -265,24 +272,23 @@ class DiTBlock(nn.Module):
         self.norm_mlp = RMSNorm(dim)
         self.mlp = SwiGLU(dim, mlp_mult=mlp_mult, dropout=dropout)
         self.resid_dropout = nn.Dropout(dropout)
-        # 6 * dim of modulation params per token.
+        # 6 * dim of modulation params per chunk.
         self.mod = _zero_(nn.Linear(cond_dim, 6 * dim, bias=True))
 
-    def forward(self, x: torch.Tensor, c: torch.Tensor, attn_mask: Optional[torch.Tensor]) -> torch.Tensor:
-        # c: [B, L, cond_dim]
-        mod = self.mod(F.silu(c))  # [B, L, 6*dim]
+    def forward(self, x: torch.Tensor, c: torch.Tensor, attn_mask, pos, kv=None):
+        mod = self.mod(F.silu(c))  # [B, n_chunks, 1, 6*dim]
         scale_a, shift_a, gate_a, scale_m, shift_m, gate_m = mod.chunk(6, dim=-1)
 
         # Attention path
         h = self.norm_attn(x) * (1.0 + scale_a) + shift_a
-        h = self.attn(h, attn_mask=attn_mask)
+        h, kv = self.attn(h, attn_mask=attn_mask, pos=pos, kv=kv)
         x = x + gate_a * self.resid_dropout(h)
 
         # MLP path
         h = self.norm_mlp(x) * (1.0 + scale_m) + shift_m
         h = self.mlp(h)
         x = x + gate_m * self.resid_dropout(h)
-        return x
+        return x, kv
 
 
 # --------------------------------------------------------------------------- #
@@ -392,37 +398,52 @@ class FlowDiT(nn.Module):
         x_t: torch.Tensor,
         t: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        pos: Optional[torch.Tensor] = None,
+        kv: Optional[list] = None,
+        return_kv: bool = False,
+    ):
         """Predict velocity at noise level `t` (in normalized space).
 
         Args:
-            x_t: [B, L, latent_dim] in *normalized* space.
-            t:   [B, L] floats in [0, 1].
-            attn_mask: optional [L, L] additive mask. If None, a block-causal
-                       mask is built on the fly.
+            x_t: [B, L, latent_dim] in *normalized* space; L a multiple of block_size.
+            t:   [B, L] floats in [0, 1], constant within each chunk.
+            attn_mask: optional [L, L] additive mask. If None (and no `kv`), a
+                       block-causal mask is built on the fly.
+            pos: optional [L] RoPE positions; default continues after any cached tokens.
+            kv: per-layer (k, v) of a clean context from a `return_kv=True` call. The
+                L tokens (one chunk) then attend to that context and to each other.
+            return_kv: also return this call's per-layer (k, v).
         """
         b, l, _ = x_t.shape
-        if l > self.max_seq_len:
-            raise ValueError(
-                f"sequence length {l} exceeds max_seq_len {self.max_seq_len}"
-            )
-        h = self.proj_in(x_t)
+        bs = self.block_size
+        if l % bs:
+            raise ValueError(f"sequence length {l} is not a multiple of block_size {bs}")
+        if pos is None:
+            start = 0 if kv is None else kv[0][0].shape[2]
+            if start + l > self.max_seq_len:
+                raise ValueError(
+                    f"sequence length {start + l} exceeds max_seq_len {self.max_seq_len}"
+                )
+            pos = torch.arange(start, start + l, device=x_t.device)
+        h = self.proj_in(x_t).view(b, l // bs, bs, self.dim)
 
-        # Per-token conditioning.
-        t_emb = timestep_embedding(t, self.cond_dim)  # [B, L, cond_dim]
-        c = self.cond_mlp(t_emb)
+        # One conditioning vector per chunk (t is constant within a chunk).
+        c = self.cond_mlp(timestep_embedding(t[:, ::bs], self.cond_dim)).unsqueeze(2)
 
-        if attn_mask is None:
+        if attn_mask is None and kv is None:
             from ..utils import block_causal_mask
-            attn_mask = block_causal_mask(l, self.block_size, device=h.device)
-        # Cast to the activation dtype so SDPA doesn't see mixed dtypes inside autocast.
-        attn_mask = attn_mask.to(h.dtype)
+            attn_mask = block_causal_mask(l, bs, device=h.device)
+        if attn_mask is not None:
+            # Cast to the activation dtype so SDPA doesn't see mixed dtypes inside autocast.
+            attn_mask = attn_mask.to(h.dtype)
 
-        for block in self.blocks:
-            h = block(h, c, attn_mask=attn_mask)
+        new_kv = []
+        for i, block in enumerate(self.blocks):
+            h, layer_kv = block(h, c, attn_mask, pos, None if kv is None else kv[i])
+            new_kv.append(layer_kv)
 
         # Output AdaLN + projection
         scale, shift = self.mod_out(F.silu(c)).chunk(2, dim=-1)
         h = self.norm_out(h) * (1.0 + scale) + shift
-        v_pred = self.proj_out(h)
-        return v_pred
+        v_pred = self.proj_out(h).view(b, l, -1)
+        return (v_pred, new_kv) if return_kv else v_pred

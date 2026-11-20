@@ -7,12 +7,14 @@ Usage:
         --duration-s  20               \
         --nfe         8                \
         --solver      heun             \
-        --out         ./out.wav        \
-        --device      mps
+        --out         ./out.wav
 
 If `--prompt-wav` is omitted, the model generates unconditionally (no prefix).
-The output `.wav` contains [prompt + generation] concatenated, so you can hear
-the seam.
+`--mode joint` (default) denoises the whole continuation at once; prompt +
+continuation must fit the model window (~87 s). `--mode chunked` generates
+chunk by chunk with a sliding context window, exactly like `realtime`, so any
+duration works. The output `.wav` contains [prompt + generation] concatenated,
+so you can hear the seam.
 """
 
 from __future__ import annotations
@@ -20,22 +22,14 @@ from __future__ import annotations
 import argparse
 import math
 from dataclasses import asdict
-from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import soundfile as sf
 import torch
 
 from .codec_wrapper import CodecConfig, CodecWrapper
-from .config import (
-    CODEC_CHUNK_SAMPLES,
-    CODEC_LATENT_DIM,
-    CODEC_TOKENS_PER_CHUNK,
-    CFMConfig,
-    ModelConfig,
-)
-from .model.cfm import SUPPORTED_SCHEDULES, SUPPORTED_SOLVERS, sample as cfm_sample
+from .config import CODEC_CHUNK_SAMPLES, CODEC_SAMPLE_RATE, ModelConfig
+from .model.cfm import SUPPORTED_SCHEDULES, SUPPORTED_SOLVERS, generate, sample_joint
 from .model.dit import FlowDiT
 from .model.ema import EMA
 from .utils import best_device, get_logger
@@ -43,37 +37,25 @@ from .utils import best_device, get_logger
 logger = get_logger("flow.sample")
 
 
-def load_model(ckpt_path: str, device: torch.device) -> FlowDiT:
-    sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    cfg_dict = sd["config"]["model"]
-    model_cfg = ModelConfig(**cfg_dict)
-    model = FlowDiT(
-        latent_dim=model_cfg.latent_dim,
-        block_size=model_cfg.block_size,
-        dim=model_cfg.dim,
-        n_layers=model_cfg.n_layers,
-        n_heads=model_cfg.n_heads,
-        head_dim=model_cfg.head_dim,
-        mlp_mult=model_cfg.mlp_mult,
-        cond_dim=model_cfg.cond_dim,
-        max_seq_len=model_cfg.max_seq_len,
-        dropout=model_cfg.dropout,
-    )
-    # Load EMA weights into the model.
-    ema_state = sd.get("ema", None)
-    if ema_state is None:
-        raise RuntimeError(f"checkpoint {ckpt_path} has no 'ema' field")
-    ema = EMA(model, decay=0.0)  # decay value doesn't matter for loading
-    ema.load_state_dict(ema_state)
-    ema.copy_to(model)
-    model.to(device).eval()
-    return model
-
-
-def duration_to_target_tokens(duration_s: float, block_size: int) -> int:
-    """Round up to a whole number of chunks."""
-    chunks = math.ceil(duration_s * 48_000 / CODEC_CHUNK_SAMPLES)
-    return chunks * block_size
+def load_model(ckpt_path: str, device: torch.device, use_ema: bool = True) -> FlowDiT:
+    """Rebuild a FlowDiT from `ema.pt` or `last.pt`; EMA weights unless `use_ema=False`."""
+    sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    if "config" not in sd or "model" not in sd["config"]:
+        raise RuntimeError(f"checkpoint {ckpt_path} has no 'config.model' field; cannot rebuild architecture")
+    model = FlowDiT(**{**asdict(ModelConfig(**sd["config"]["model"])), "dropout": 0.0})
+    if use_ema:
+        if sd.get("ema") is None:
+            raise RuntimeError(f"checkpoint {ckpt_path} has no 'ema' field")
+        ema = EMA(model, decay=0.0)  # decay value doesn't matter for loading
+        ema.load_state_dict(sd["ema"])
+        ema.copy_to(model)
+        logger.info("Loaded EMA weights from %s", ckpt_path)
+    else:
+        if "model" not in sd:
+            raise RuntimeError(f"checkpoint {ckpt_path} has no 'model' field (ema.pt only has EMA weights)")
+        model.load_state_dict(sd["model"])
+        logger.info("Loaded raw (non-EMA) weights from %s", ckpt_path)
+    return model.to(device).eval()
 
 
 @torch.no_grad()
@@ -83,21 +65,29 @@ def main() -> None:
     p.add_argument("--prompt-wav", default=None, help="Optional prompt audio (any sr, stereo or mono).")
     p.add_argument("--duration-s", type=float, default=20.0,
                    help="Duration of the *generated continuation* in seconds (excludes prompt).")
-    p.add_argument("--nfe", type=int, default=8, help="Number of ODE/SDE steps.")
+    p.add_argument("--nfe", type=int, default=8,
+                   help="Solver steps per chunk (model calls per step: heun/midpoint 2, rk4 4, others 1).")
     p.add_argument("--solver", default="heun", choices=list(SUPPORTED_SOLVERS),
                    help="Sampler: euler/heun/midpoint/rk4 (deterministic ODE), "
                         "dpmpp (DPM-Solver++ 2M for RF), pingpong (stochastic SDE).")
     p.add_argument("--schedule", default="linear", choices=list(SUPPORTED_SCHEDULES),
                    help="Time grid: 'linear' (default) or 'shifted' (logSNR shift).")
     p.add_argument("--schedule-shift", type=float, default=0.0,
-                   help="LogSNR shift exponent for --schedule shifted (e.g. 1.0-3.0 for long sequences).")
+                   help="LogSNR shift exponent for --schedule shifted (e.g. 1.0-3.0).")
+    p.add_argument("--temperature", type=float, default=1.0,
+                   help="Velocity scaling: <1 sharpens, >1 leaves more noise.")
+    p.add_argument("--mode", default="joint", choices=["joint", "chunked"],
+                   help="joint: denoise the whole continuation at once (fits ~87 s with the prompt). "
+                        "chunked: chunk by chunk like realtime, any duration.")
+    p.add_argument("--context-chunks", type=int, default=32,
+                   help="--mode chunked: sliding context window in chunks (1 chunk ~ 0.683 s).")
     p.add_argument("--out", required=True, help="Output .wav path.")
     p.add_argument("--device", default=None)
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--seed", type=int, default=None)
     p.add_argument("--decode-mode", default="parallel", choices=["parallel", "autoregressive"])
     args = p.parse_args()
 
-    if args.seed:
+    if args.seed is not None:
         torch.manual_seed(args.seed)
 
     device = best_device(args.device)
@@ -105,11 +95,9 @@ def main() -> None:
 
     # Load model + codec.
     model = load_model(args.ckpt, device)
-    block_size = model.block_size
     codec = CodecWrapper(CodecConfig(device=str(device), decode_mode=args.decode_mode))
 
     # Encode the prompt (optional).
-    prefix_latents: Optional[torch.Tensor]
     if args.prompt_wav is not None:
         wv, sr = sf.read(args.prompt_wav, dtype="float32", always_2d=True)
         wv = np.transpose(wv, (1, 0))  # [C, N]
@@ -117,51 +105,31 @@ def main() -> None:
             wv = np.repeat(wv, 2, axis=0)
         elif wv.shape[0] > 2:
             wv = wv[:2]
-        wv_t = torch.from_numpy(wv)
-        latent = codec.encode_audio(wv_t, sr=sr)  # [T*8, 64] or [T, 8, 64]
-        if latent.dim() == 3:
-            latent = latent.reshape(-1, latent.shape[-1])
-        prefix_latents = latent.unsqueeze(0).to(device)  # [1, P, 64]
-        logger.info("prompt: %.2fs of audio -> %d prefix tokens", wv.shape[-1] / sr, prefix_latents.shape[1])
+        latent = codec.encode_audio(torch.from_numpy(wv), sr=sr)  # [T, 8, 64]
+        prefix = latent.reshape(-1, latent.shape[-1]).unsqueeze(0).to(device)  # [1, P, 64]
+        logger.info("prompt: %.2fs of audio -> %d prefix tokens", wv.shape[-1] / sr, prefix.shape[1])
     else:
-        prefix_latents = torch.zeros(1, 0, model.latent_dim, device=device)
+        prefix = torch.zeros(1, 0, model.latent_dim, device=device)
         logger.info("unconditional generation (no prompt)")
 
-    # Pad prefix to a chunk boundary just in case.
-    pad_extra = (-prefix_latents.shape[1]) % block_size
-    if pad_extra > 0:
-        prefix_latents = torch.nn.functional.pad(prefix_latents, (0, 0, 0, pad_extra))
-        logger.info("padded prefix by %d tokens to align to chunk boundary", pad_extra)
-
-    n_target_tokens = duration_to_target_tokens(args.duration_s, block_size)
-    logger.info(
-        "generating %d target tokens (%.2fs) with %s, NFE=%d",
-        n_target_tokens,
-        n_target_tokens / block_size * (CODEC_CHUNK_SAMPLES / 48_000),
-        args.solver,
-        args.nfe,
-    )
-
-    full = cfm_sample(
-        model,
-        prefix=prefix_latents,
-        n_target_tokens=n_target_tokens,
-        n_steps=args.nfe,
-        solver=args.solver,
-        schedule=args.schedule,
-        schedule_shift=args.schedule_shift,
-    )  # [1, P + n_target, 64]
-
-    # Decode through the codec.
-    full = full.squeeze(0)  # [L, 64]
-    P = prefix_latents.shape[1]
-    if P > 0:
-        # Split prefix from target so we can save them separately if desired.
-        target = full[P:]
+    n_chunks = math.ceil(args.duration_s * CODEC_SAMPLE_RATE / CODEC_CHUNK_SAMPLES)
+    n_tokens = n_chunks * model.block_size
+    if args.mode == "joint" and prefix.shape[1] + n_tokens > model.max_seq_len:
+        window_s = model.max_seq_len / model.block_size * CODEC_CHUNK_SAMPLES / CODEC_SAMPLE_RATE
+        raise SystemExit(f"prompt + {args.duration_s:.0f} s exceeds the {window_s:.0f} s joint window; "
+                         "shorten it or use --mode chunked")
+    logger.info("generating %d chunks (%.2fs) with %s, %d steps, mode=%s",
+                n_chunks, n_chunks * CODEC_CHUNK_SAMPLES / CODEC_SAMPLE_RATE, args.solver, args.nfe, args.mode)
+    kw = dict(n_steps=args.nfe, solver=args.solver, temperature=args.temperature,
+              schedule=args.schedule, schedule_shift=args.schedule_shift)
+    if args.mode == "joint":
+        full = sample_joint(model, prefix, n_tokens, **kw)
     else:
-        target = full
-    # Just decode the entire concatenated latent stream.
-    wv_out = codec.decode_latents(full)
+        full = generate(model, prefix, n_chunks, context_chunks=args.context_chunks, **kw)
+    # full: [1, P + n_chunks * 8, 64]
+
+    # Decode the entire concatenated latent stream.
+    wv_out = codec.decode_latents(full.squeeze(0))
     if wv_out.dim() == 3:
         wv_out = wv_out[0]
     wv_np = wv_out.transpose(0, 1).contiguous().cpu().numpy().astype(np.float32)

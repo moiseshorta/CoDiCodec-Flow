@@ -59,6 +59,15 @@ class ModelConfig:
 class CFMConfig:
     """Conditional Flow Matching training hyperparameters."""
 
+    # Training objective.
+    #   'joint'           -- clean prefix + a target span denoised jointly at one
+    #                        noise level.
+    #   'teacher_forcing' -- every chunk is denoised from clean preceding chunks,
+    #                        exactly as `realtime` generates. Learns that condition
+    #                        much faster; overfits small datasets unless the data is
+    #                        augmented (preencode --offsets).
+    objective: str = "joint"
+
     # Time sampling.
     #   'logit_normal' -- SD3-style t = sigmoid(N(loc, scale)). Concentrates
     #                     mass near 0.5 with light tails. Best for large
@@ -66,7 +75,7 @@ class CFMConfig:
     #   'uniform'      -- t ~ Uniform(0, 1). Better for small datasets where
     #                     coverage of the [0, 0.1] tail (the hard "final
     #                     denoising steps") matters more than concentration.
-    t_sample_mode: str = "logit_normal"
+    t_sample_mode: str = "uniform"
     logit_normal_loc: float = 0.0
     logit_normal_scale: float = 1.0
 
@@ -76,12 +85,11 @@ class CFMConfig:
     # default but expose the knob.
     min_snr_gamma: float = 0.0
 
-    # Probability of treating the entire sample as a "fresh start" with no
-    # prefix (full-sequence denoising). Helps the model learn unconditional
-    # generation alongside continuation.
+    # Joint objective only: probability of treating the entire sample as a
+    # "fresh start" with no prefix (full-sequence denoising).
     p_unconditional: float = 0.1
 
-    # Range of prefix length, expressed as a fraction of the full sequence.
+    # Joint objective only: range of prefix length, as a fraction of the crop.
     prefix_min_frac: float = 0.05
     prefix_max_frac: float = 0.75
 
@@ -97,13 +105,12 @@ class DataConfig:
     data_dir: str = "./data/latents"
 
     # Training crop length, in latent tokens (1 chunk = block_size tokens).
-    # 768 tokens = 96 chunks ≈ 65.5 seconds @ 48 kHz.  (Codec produces
-    # 8 tokens / 0.683 s; 96 chunks * 0.683 s = 65.5 s.)
-    crop_tokens: int = 768
+    # 512 tokens = 64 chunks ≈ 43.7 seconds @ 48 kHz. With teacher forcing the
+    # model sees 2x this (clean + noisy), which must fit max_seq_len positions.
+    crop_tokens: int = 512
 
     val_frac: float = 0.05
     seed: int = 42
-    num_workers: int = 2  # MPS does not benefit much from many workers
 
 
 @dataclass
@@ -124,10 +131,10 @@ class TrainConfig:
     max_steps: int = 200_000
     log_every: int = 50
     val_every: int = 1_000
-    ckpt_every: int = 5_000
+    ckpt_every: int = 1_000
 
     # Periodic audio sampling so the user can hear training progress.
-    audio_sample_every: int = 1_000     # set to 0 to disable
+    audio_sample_every: int = 0         # 0 disables; e.g. 1000
     audio_n_samples: int = 2            # number of distinct samples per call
     # If True (default), generate unconditional audio from pure noise (no
     # prefix). If False, take a `audio_prompt_seconds` clip from the val set
@@ -135,8 +142,8 @@ class TrainConfig:
     audio_unconditional: bool = True
     audio_prompt_seconds: float = 4.0   # length of clean prompt (continuation mode only)
     audio_continuation_seconds: float = 8.0  # length of generated audio (also used for total length in unconditional mode together with prompt_seconds)
-    audio_nfe: int = 8                  # ODE steps for sampling
-    audio_solver: str = "heun"          # 'euler' | 'heun'
+    audio_nfe: int = 16                 # solver steps per chunk
+    audio_solver: str = "heun"          # any of cfm.SUPPORTED_SOLVERS
     audio_use_ema: bool = True          # generate with EMA weights (preferred)
 
     lr: float = 1e-4
@@ -150,6 +157,9 @@ class TrainConfig:
     # Mixed precision settings. bf16 generally works on MPS but coverage is
     # uneven; fp32 is the safe fallback.
     dtype: str = "bf16"  # 'fp32' | 'bf16' | 'fp16'
+
+    # torch.compile the training forward (CUDA; adds ~1 min of startup).
+    compile: bool = False
 
     seed: int = 42
 

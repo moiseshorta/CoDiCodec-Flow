@@ -22,12 +22,18 @@ sequence.
   The continuous latents, after the codec's `atanh / sigma_rescale=0.8`
   transform, are approximately unit-Gaussian — a direct fit for flow
   matching.
-- **Block-causal Flow Matching DiT** is the simplest architecture that:
-  1. respects the codec's chunk structure,
-  2. supports KV-caching for efficient streaming inference,
-  3. has unconditional dropout-based classifier-free guidance for free.
-- The whole pipeline is **MPS-friendly** so it can be trained and run in
-  real-time on a 36 GB Apple Silicon laptop.
+- **Block-causal Flow Matching DiT**: bidirectional attention within a chunk,
+  causal across chunks, matching the codec's chunk structure. Generation runs
+  chunk by chunk: the clean context window goes through the model once per
+  chunk (its keys/values are cached) and the solver steps only run the 8 new
+  tokens.
+- **Two training objectives**: `joint` (default) denoises a continuation span
+  jointly after a clean prefix; `teacher_forcing` trains every chunk exactly as
+  realtime generates it (clean context → one noisy chunk, each chunk with its
+  own noise level). Teacher forcing learns that condition much faster; on
+  small datasets pair it with augmentation (`preprocess --offsets`).
+- Runs on CUDA and Apple Silicon (MPS); trains and runs in real time on a
+  36 GB Apple Silicon laptop.
 
 ## Google Colab
 
@@ -44,6 +50,7 @@ Click the badge at the top of this README to open the notebook in Colab.
 
 ```
 codicodec-flow/
+  cli.py               `python cli.py <command> ...` entry point
   codicodec/           upstream codec package (do not modify)
   flow/                this project
     __init__.py
@@ -52,13 +59,15 @@ codicodec-flow/
     utils.py           device, masks, logging
     data/
       preencode.py     audio dir -> per-file .pt latent shards
-      latent_dataset.py
+      latent_dataset.py  in-memory crops, train/val split by recording
     model/
-      dit.py           block-causal flow-matching DiT
-      cfm.py           CFM loss + Euler/Heun samplers
+      dit.py           block-causal flow-matching DiT (with K/V caching)
+      cfm.py           training losses + samplers (joint, chunk by chunk)
       ema.py
     train.py           training loop
     sample.py          offline sampling
+    realtime.py        live streaming generation
+    server.py          stdio JSON backend for an external GUI
     smoke_test.py      end-to-end sanity check
   requirements.txt
   README.md            (this file)
@@ -77,26 +86,32 @@ pip install -r requirements.txt
 # Install the upstream CoDiCodec package
 pip install -e ./codicodec
 
-# Verify codec works on your machine (downloads checkpoint on first run)
-python -m flow.smoke_test --device mps  # Use 'cuda' for NVIDIA GPUs
+# Linux only, for realtime playback: the PortAudio library used by sounddevice
+sudo apt install libportaudio2
+
+# Verify the model and codec work on your machine (downloads the codec checkpoint on first run)
+python -m flow.smoke_test --with-codec
 ```
 
 ## CLI Interface
 
-codicodec-flow provides a user-friendly CLI wrapper that simplifies training, preprocessing, and generation without requiring `python -m flow...` commands.
+`cli.py` forwards each command's options unchanged to the matching module
+(`flow.data.preencode`, `flow.train`, `flow.sample`, `flow.realtime`), so
+`python cli.py <command> -h` lists everything a command accepts. The device is
+auto-detected (CUDA, then MPS, then CPU); pass `--device` to override.
 
 ```bash
 # Preprocess audio data
-python cli.py preprocess --in-dir ~/music/training --out-dir ./data/latents --device mps
+python cli.py preprocess --in-dir ~/music/training --out-dir ./data/latents
 
-# Train a model (TUI monitoring enabled by default)
-python cli.py train --data-dir ./data/latents --out-dir ./runs/v0 --device mps
+# Train a model (progress bar + log lines)
+python cli.py train --data-dir ./data/latents --out-dir ./runs/v0
 
 # Generate audio
-python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --out ./out.wav --device mps
+python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --out ./out.wav
 
 # Stream audio indefinitely with live keyboard controls (press 'q' to quit)
-python cli.py realtime --ckpt ./runs/v0/ema.pt --use-ema --device mps
+python cli.py realtime --ckpt ./runs/v0/ema.pt --use-ema
 ```
 
 See [Real-time Streaming Generation](#real-time-streaming-generation) for the full list of options and live keyboard controls.
@@ -108,27 +123,30 @@ Before training, you need to convert your audio files into latent shards using t
 ```bash
 python cli.py preprocess \
     --in-dir   /path/to/your/audio \
-    --out-dir  ./data/latents      \
-    --device   mps                 \
-    --max-seconds 60
+    --out-dir  ./data/latents
 ```
 
 **Arguments:**
 - `--in-dir`: Directory containing audio files (WAV, MP3, FLAC, etc.)
 - `--out-dir`: Output directory for latent shards (.pt files)
-- `--device`: `mps` for Apple Silicon, `cuda` for NVIDIA GPUs, `cpu` as fallback
-- `--max-seconds`: Maximum duration per file (default: 300s). Longer files are split.
+- `--device`: `mps`, `cuda` or `cpu` (default: auto)
+- `--max-seconds`: Files longer than this (default: 300 s) are encoded in segments to bound memory. Segments are cut on the codec's chunk grid, so the result is identical to encoding the whole file.
+- `--offsets N`: augmentation for small datasets. Also encodes each file shifted by 1/N, 2/N, ... of a chunk, which gives different latents for the same music (N× data).
+- `--swap-lr`: augmentation. Also encodes left/right-swapped copies (2× data).
+- `--overwrite`: re-encode files that already have a `.pt`.
 
 **Output:**
-- Each audio file produces a `.pt` file containing the encoded latent representation
+- Each audio file produces a `.pt` file containing the encoded latent representation (plus `<name>_o<k>[_lr].pt` variants when augmenting)
 - Latents are stored as `[T, 8, 64]` tensors (T = number of 0.683s chunks)
-- Files are stored with metadata for the dataset loader
+- Each shard records its source file; the train/val split keeps all variants of a recording on the same side
 
 **Tips:**
 - Use diverse audio for better generalization (different styles, instruments, tempos)
-- 48 kHz stereo audio is recommended (CoDiCodec's native rate)
-- Aim for several hours of audio for reasonable training
-- Train for at least 100K steps for meaningful results; the v3_okachihuali model was trained for 6,860,000 steps
+- 48 kHz stereo audio is recommended (CoDiCodec's native rate); other rates are resampled
+- Aim for several hours of audio for reasonable training; on small datasets add `--offsets 4`
+- Files shorter than a training crop (default ~44 s) are skipped at training time; the training log reports how much was dropped
+- Latents encoded before this version have a short zero-padded gap every `--max-seconds` for files longer than that; re-encode with `--overwrite`
+- Train for at least 100K steps for meaningful results; the v3_okachihuali model was trained for ~700,000 steps
 
 ## Training
 
@@ -138,7 +156,6 @@ Train a block-causal Flow Matching DiT model on the preprocessed latents.
 python cli.py train \
     --data-dir   ./data/latents \
     --out-dir    ./runs/v0      \
-    --device     mps            \
     --batch-size 4              \
     --grad-accum 2              \
     --crop-tokens 512          \
@@ -148,38 +165,50 @@ python cli.py train \
 **Key Arguments:**
 - `--data-dir`: Directory containing preprocessed latent shards
 - `--out-dir`: Output directory for checkpoints and logs
-- `--device`: `mps`, `cuda`, or `cpu`
+- `--device`: `mps`, `cuda`, or `cpu` (default: auto)
 - `--batch-size`: Batch size per GPU (default: 8, use 4 on MPS)
 - `--grad-accum`: Gradient accumulation steps (effective batch = batch_size × grad_accum)
-- `--crop-tokens`: Random crop length in tokens (default: 768, must be multiple of 8)
+- `--crop-tokens`: Random crop length in tokens (default: 512 ≈ 44 s, must be multiple of 8)
 - `--max-steps`: Total training steps (default: 200000)
 - `--dtype`: `bf16` for bfloat16 (faster, less memory) or `fp32` for float32
 - `--lr`: Learning rate (default: 1e-4 with cosine decay)
-- `--ema-decay`: EMA decay rate (default: 0.9999)
+- `--objective`: `joint` (default) is the original objective: a clean prefix plus a target span denoised jointly at one noise level. `teacher_forcing` trains every chunk the way realtime generates it (clean context → one noisy chunk, its own noise level per chunk). In a small test (1.6 h of audio, 20M model, 3k steps, `next_chunk_loss` on an unseen recording), teacher forcing on `preprocess --offsets 2` data was best at every checkpoint (1.385 vs 1.422 for `joint` on the same data) and reached `joint`'s final loss within 1k steps. Without augmentation it overfit after ~1.5k steps and ended worse (1.469 vs 1.434). So: use it together with `--offsets`, and watch `next_chunk_loss`.
+- `--compile`: `torch.compile` the training forward (CUDA; about a minute of startup)
+- `--t-sample-mode`: `uniform` (default) or `logit_normal`
+- `--init-from`: initialize weights from another run's `last.pt` (fine-tuning; fresh optimizer and dataset stats)
+
+All the data is loaded into memory once (1 h of audio ≈ 11 MB of latents), so
+there are no data-loader workers to tune.
 
 **Model Size Configuration:**
 
 Default (~97M params, recommended for 36GB+ RAM):
 ```bash
 python cli.py train --data-dir ./data/latents --out-dir ./runs/v0 \
-    --device mps --batch-size 4 --grad-accum 2 --crop-tokens 512 \
+    --batch-size 4 --grad-accum 2 --crop-tokens 512 \
     --dtype bf16 --max-steps 200000
 ```
 
 Smaller (~20M params, faster iteration):
 ```bash
 python cli.py train --data-dir ./data/latents --out-dir ./runs/v0 \
-    --device mps --batch-size 8 --grad-accum 2 --crop-tokens 512 \
+    --batch-size 8 --grad-accum 2 --crop-tokens 512 \
     --dtype bf16 --max-steps 200000 \
     --dim 384 --n-layers 8 --n-heads 6 --cond-dim 384
 ```
 
+Try the teacher-forcing objective on an existing model (no architecture
+change, so any earlier checkpoint loads; watch `next_chunk_loss`):
+```bash
+python cli.py train --data-dir ./data/latents --out-dir ./runs/v3_tf \
+    --init-from ./runs/v3_okachihuali/last.pt --objective teacher_forcing
+```
+
 **Training Details:**
-- Checkpoints are saved every 50 steps: `last.pt` (latest) and `ema.pt` (EMA copy)
-- Periodic audio samples are generated during training (unconditional by default)
-- Use `--audio-continuation` to enable continuation sampling during training
-- Use `--audio-sample-every N` to control sampling frequency (0 to disable)
-- Logs include loss, learning rate, and sample metrics
+- Checkpoints are saved every 1000 steps (`--ckpt-every`): `last.pt` (latest, for resuming) and `ema.pt` (EMA copy, for inference). Re-running the same command resumes from `last.pt`.
+- Validation reports `next_chunk_loss`: the loss of denoising each held-out chunk from its clean preceding chunks, i.e. the realtime condition. It's comparable across steps, runs and objectives.
+- Audio previews are off by default; `--audio-sample-every 1000` writes clips to `out_dir/samples/` (sampled the way the objective trains: whole continuation for `joint`, chunk by chunk for `teacher_forcing`). Unconditional by default; `--audio-continuation` continues fixed validation clips instead.
+- Logs include loss, learning rate, and steps/s
 
 ## Generation
 
@@ -194,28 +223,29 @@ python cli.py sample \
     --duration-s  20               \
     --nfe         8                \
     --solver      heun             \
-    --out         ./out.wav        \
-    --device      mps
+    --out         ./out.wav
 ```
 
 **Arguments:**
 - `--ckpt`: Path to checkpoint (use `ema.pt` for best quality, `last.pt` for latest)
 - `--prompt-wav`: Audio prompt file (WAV, 48 kHz stereo recommended)
 - `--duration-s`: Duration of continuation in seconds (default: 20)
-- `--nfe`: Number of function evaluations (sampling steps, default: 8)
+- `--mode`: `joint` (default) denoises the whole continuation at once; prompt + continuation must fit the model window (~87 s). `chunked` generates chunk by chunk with a sliding context window, exactly like realtime, so any length works.
+- `--nfe`: Solver steps per chunk (default: 8). Model calls per step depend on the solver, see below.
 - `--solver`: Sampler (default `heun`). Supported:
-  - `euler`    : 1st-order ODE, 1 NFE/step (fastest baseline)
-  - `heun`     : 2nd-order ODE, 2 NFE/step (default)
-  - `midpoint` : 2nd-order RK2, 2 NFE/step
-  - `rk4`      : 4th-order Runge-Kutta, 4 NFE/step (highest quality at low NFE)
-  - `dpmpp`    : DPM-Solver++ 2M for rectified flow, 1 NFE/step (strong at NFE 4-8)
-  - `pingpong` : stochastic SDE sampler, 1 NFE/step (recommended for distilled / few-step models)
+  - `euler`    : 1st-order ODE, 1 model call/step (fastest baseline)
+  - `heun`     : 2nd-order ODE, 2 calls/step (default; the last step is Euler)
+  - `midpoint` : 2nd-order RK2, 2 calls/step
+  - `rk4`      : 4th-order Runge-Kutta, 4 calls/step (the last step is Euler)
+  - `dpmpp`    : DPM-Solver++ 2M for rectified flow, 1 call/step (strong at 4-8 steps)
+  - `pingpong` : stochastic SDE sampler, 1 call/step (recommended for distilled / few-step models)
 - `--schedule`: Time grid: `linear` (default) or `shifted` (logSNR shift)
-- `--schedule-shift`: LogSNR shift exponent for `--schedule shifted` (e.g. `1.0`-`3.0` for long sequences)
+- `--schedule-shift`: LogSNR shift exponent for `--schedule shifted` (e.g. `1.0`-`3.0`)
+- `--context-chunks`: `--mode chunked` only: sliding context window in chunks (default: 32 ≈ 22 s, as in realtime)
+- `--temperature`: Velocity scaling (default: 1.0; <1 sharpens, >1 leaves more noise)
+- `--seed`: Fix the random seed
 - `--out`: Output audio file path
-- `--device`: `mps`, `cuda`, or `cpu`
-- `--temperature`: Sampling temperature (default: 1.0, higher = more diverse)
-- `--n-steps`: Number of diffusion steps (default: 32)
+- `--device`: `mps`, `cuda`, or `cpu` (default: auto)
 
 ### Unconditional generation
 
@@ -225,8 +255,7 @@ python cli.py sample \
     --duration-s  20               \
     --nfe         8                \
     --solver      heun             \
-    --out         ./out_uncond.wav \
-    --device      mps
+    --out         ./out_uncond.wav
 ```
 
 Omit `--prompt-wav` for unconditional generation (no prompt context).
@@ -235,33 +264,33 @@ Omit `--prompt-wav` for unconditional generation (no prompt context).
 
 **Higher quality with more sampling steps:**
 ```bash
-python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duration-s 30 --nfe 16 --solver heun --out ./out_high_quality.wav --device mps
+python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duration-s 30 --nfe 16 --solver heun --out ./out_high_quality.wav
 ```
 
 **Faster generation with fewer steps:**
 ```bash
-python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duration-s 20 --nfe 4 --solver euler --out ./out_fast.wav --device mps
+python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duration-s 20 --nfe 4 --solver euler --out ./out_fast.wav
 ```
 
 **Adjust temperature for diversity:**
 ```bash
-python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duration-s 20 --nfe 8 --solver heun --temperature 1.5 --out ./out_diverse.wav --device mps
+python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duration-s 20 --nfe 8 --solver heun --temperature 1.5 --out ./out_diverse.wav
 ```
 
 **DPM-Solver++ for very low NFE:**
 ```bash
-python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duration-s 20 --nfe 6 --solver dpmpp --out ./out_dpmpp.wav --device mps
+python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duration-s 20 --nfe 6 --solver dpmpp --out ./out_dpmpp.wav
 ```
 
 **RK4 for highest quality at low NFE:**
 ```bash
-python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duration-s 20 --nfe 4 --solver rk4 --out ./out_rk4.wav --device mps
+python cli.py sample --ckpt ./runs/v0/ema.pt --prompt-wav ./prompt.wav --duration-s 20 --nfe 4 --solver rk4 --out ./out_rk4.wav
 ```
 
 **Sampling Trade-offs:**
-- **NFE (steps)**: More steps = better quality but slower. 4-8 is real-time, 16+ is high quality.
-- **Solver**: `euler`/`dpmpp`/`pingpong` use 1 NFE per step; `heun`/`midpoint` use 2; `rk4` uses 4. `dpmpp` and `rk4` give the best quality at very low total NFE; `pingpong` adds stochasticity (only recommended for distilled models).
-- **Schedule**: `--schedule shifted --schedule-shift 1.0` warps the time grid in log-SNR space (SD3-style); helpful for long sequences or low NFE.
+- **Steps (`--nfe`)**: More steps = better quality but slower. In realtime and `--mode chunked` each step only runs the 8 new tokens (the context is computed once per chunk), so extra steps are cheap.
+- **Solver**: `euler`/`dpmpp`/`pingpong` use 1 model call per step; `heun`/`midpoint` use 2; `rk4` uses 4. Compare solvers at equal model calls, e.g. `euler --nfe 8` vs `heun --nfe 4`. `pingpong` adds stochasticity (only recommended for distilled models).
+- **Schedule**: `--schedule shifted --schedule-shift 1.0` warps the time grid in log-SNR space (SD3-style); helpful at low step counts.
 - **Temperature**: Higher values increase diversity but may reduce coherence.
 
 ## Real-time Streaming Generation
@@ -276,10 +305,10 @@ checkpoint.
 
 ```bash
 # Minimal: stream from a checkpoint until you press 'q'
-python cli.py realtime --ckpt ./runs/v3_okachihuali/ema.pt --use-ema --device mps
+python cli.py realtime --ckpt ./runs/v3_okachihuali/ema.pt --use-ema
 
 # Same thing, but called directly as a module
-python -m flow.realtime --ckpt ./runs/v3_okachihuali/ema.pt --use-ema --device mps
+python -m flow.realtime --ckpt ./runs/v3_okachihuali/ema.pt --use-ema
 ```
 
 On launch you'll see the engine load the model, prebuffer a couple of chunks
@@ -311,9 +340,6 @@ python cli.py realtime --ckpt ./runs/v0/ema.pt --use-ema --seed 12345
 # Stop automatically after 200 chunks (~137 s @ 48 kHz)
 python cli.py realtime --ckpt ./runs/v0/ema.pt --use-ema --max-chunks 200
 
-# Use a converted CoreML model (auto-falls back to PyTorch on shape mismatch)
-python cli.py realtime --ckpt ./runs/v0/ema.pt --use-ema \
-    --coreml-path ./runs/v0/model.mlpackage
 ```
 
 ### CLI options
@@ -323,8 +349,7 @@ python cli.py realtime --ckpt ./runs/v0/ema.pt --use-ema \
 | `--ckpt PATH` | *required* | Checkpoint to load (`last.pt` or `ema.pt`). |
 | `--use-ema` | off | Load EMA weights — strongly recommended for inference. |
 | `--device DEV` | auto | `mps`, `cuda`, or `cpu`. Auto-detected if omitted. |
-| `--coreml-path PATH` | none | Optional CoreML `.mlpackage`. Falls back to PyTorch when the variable sliding-window shape does not match the traced shape. |
-| `--nfe N` | `4` | ODE steps per chunk. Higher = better quality, lower = lower latency. |
+| `--nfe N` | `4` | Solver steps per chunk. Higher = better quality, lower = lower latency. |
 | `--solver NAME` | `euler` | One of `euler`, `heun`, `midpoint`, `rk4`, `dpmpp`, `pingpong`. |
 | `--temperature F` | `1.0` | Velocity scaling. `<1` sharpens, `>1` diffuses. |
 | `--seed-scale F` | `0.0` | Shrinks initial noise toward zero (0 = standard `N(0, I)`). |
@@ -394,11 +419,15 @@ time. Press `?` at any moment to print the up-to-date help in the terminal.
 - The model generates one **codec chunk** per inference call. Each chunk is
   decoded to ~0.683 s of 48 kHz stereo audio.
 - A **sliding window** of the last `--context-chunks` chunks is fed back as
-  context, so the model has memory of recent material.
+  context, so the model has memory of recent material. The window runs through
+  the model once per chunk (its keys/values are cached); the solver steps then
+  only run the new chunk's 8 tokens.
 - A **prebuffer** of `--prebuffer` chunks is rendered before audio starts;
   after that, generation runs in lockstep with playback. If your machine
-  generates faster than real-time, the engine throttles to avoid growing the
-  buffer unbounded; if it's slower, you'll see underruns logged.
+  generates faster than real-time, the engine keeps ~3 s queued, so key
+  presses are heard within ~3 s (a little more on machines that need the
+  margin to render a crossfade without gaps); if it's slower, you'll see
+  underruns logged.
 - Each chunk prints an **RT %** metric: `audio_seconds / compute_seconds × 100`.
   Values **> 100%** mean the model is generating faster than real-time (good),
   values **< 100%** mean it can't keep up and you'll eventually hit underruns.
@@ -416,59 +445,8 @@ time. Press `?` at any moment to print the up-to-date help in the terminal.
 - **No sound**: confirm your default output device is correct
   (the engine uses `sounddevice`'s default). On macOS, you can change the
   default output in `System Settings > Sound`.
-- **CoreML keeps falling back to PyTorch**: this is expected — the traced
-  CoreML graph has a fixed shape, but realtime uses a variable sliding
-  window. CoreML is most useful for fixed-shape batch inference.
-
-## CoreML Support
-
-CoDiCodec-Flow includes experimental CoreML support for inference on Apple Silicon. CoreML can leverage the Apple Neural Engine (ANE) for potentially more power-efficient inference.
-
-### Converting a Checkpoint to CoreML
-
-To convert a trained checkpoint to CoreML format:
-
-```bash
-# Install coremltools first
-pip install coremltools
-
-# Convert the checkpoint
-python cli.py convert-coreml \
-    --ckpt runs/v3_okachihuali/ema.pt \
-    --out runs/v3_okachihuali/model.mlpackage \
-    --use-ema \
-    --context-chunks 32 \
-    --min-deployment-target macos13
-```
-
-**Important Limitations:**
-- CoreML models are traced with fixed input shapes. The `--context-chunks` parameter determines the sequence length used during conversion.
-- Realtime audio generation uses variable sequence lengths (sliding window), which CoreML does not support natively. The CoreML backend will automatically fall back to PyTorch MPS when shapes don't match.
-- For this reason, **CoreML is not recommended for realtime generation**. It may be useful for:
-  - Batch inference with fixed shapes
-  - Experimentation and performance comparison
-
-### Using CoreML for Inference
-
-To use the CoreML model for inference (with automatic fallback to PyTorch):
-
-```bash
-python -m flow.realtime \
-    --ckpt runs/v3_okachihuali/ema.pt \
-    --use-ema \
-    --coreml-path runs/v3_okachihuali/model.mlpackage \
-    --device mps \
-    --solver euler \
-    --nfe 4
-```
-
-If CoreML inference fails (e.g., due to shape mismatch), the system automatically falls back to PyTorch MPS backend.
-
-### Performance Considerations
-
-- **MPS (PyTorch)**: Recommended for most use cases, especially realtime generation. Supports dynamic shapes and is well-optimized for Apple Silicon GPUs.
-- **CoreML**: May offer better power efficiency for batch inference with fixed shapes. Not suitable for the dynamic sliding-window pattern used in realtime generation.
-- **Fallback**: The implementation includes automatic fallback from CoreML to PyTorch, ensuring compatibility even if CoreML fails.
+- **"PortAudio library not found" (Linux)**: install it with
+  `sudo apt install libportaudio2`.
 
 ## Audio Examples
 

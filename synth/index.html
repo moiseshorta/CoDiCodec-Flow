@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spectral FM</title>
+<style>
+*{margin:0;box-sizing:border-box}
+body{display:grid;place-items:center;min-height:100vh;background:#0a0a12;color:#ccc;font-family:system-ui,sans-serif;overflow-x:auto}
+.panel{width:1000px;max-width:100%;padding:20px;border-radius:16px;background:#12121f;box-shadow:0 8px 32px #0006}
+h1{text-align:center;font-size:1.3rem;margin:0 0 12px;color:#7faaff}
+canvas{width:100%;height:56px;border-radius:8px;background:#08080f;margin-bottom:10px}
+.tabs{display:flex;gap:4px;margin-bottom:10px;flex-wrap:wrap}
+.tab{padding:6px 14px;border-radius:8px;border:1px solid #333;background:#1a1a2e;color:#888;cursor:pointer;font-size:.8rem}
+.tab.active{background:#2a2a4e;color:#a0c4ff;border-color:#a0c4ff}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;margin-bottom:10px}
+.card{background:#0e0e1a;border-radius:10px;padding:12px;border:1px solid #222}
+.card h3{font-size:.85rem;margin:0 0 8px;color:#7faaff}
+.row{display:flex;gap:6px;align-items:center;margin-bottom:4px}
+.row label{font-size:.7rem;color:#666;min-width:42px}
+.row input[type=range]{flex:1;accent-color:#7faaff;height:16px}
+.row .val{font-size:.7rem;color:#aaa;min-width:48px;text-align:right}
+.row select{background:#1a1a2e;color:#ccc;border:1px solid #333;border-radius:4px;padding:2px 4px;font-size:.75rem}
+.kb-wrap{position:relative;margin-top:10px}
+.kb{display:flex;justify-content:center;position:relative;height:110px;user-select:none}
+.k{display:flex;align-items:flex-end;justify-content:center;padding-bottom:6px;border-radius:0 0 6px 6px;cursor:pointer;font-size:.6rem;color:#888}
+.k.w{width:30px;height:110px;background:#eee;color:#555;border:1px solid #ccc;z-index:1}
+.k.w.on{background:#7faaff}
+.k.b{width:20px;height:70px;background:#222;color:#aaa;position:absolute;z-index:2}
+.k.b.on{background:#4a4aff}
+.info{text-align:center;font-size:.65rem;color:#555;margin-top:8px}
+</style>
+</head>
+<body>
+<div class="panel">
+  <h1>🎛️ Spectral FM</h1>
+  <canvas id="viz"></canvas>
+  <div class="tabs" id="tabs"></div>
+  <div class="grid" id="ctrl"></div>
+  <div class="kb-wrap"><div class="kb" id="kb"></div></div>
+  <div class="info">Z-M = C3–B3 (white: Z X C V B N M, black: S D G H J) &nbsp;|&nbsp; Q-P = C4–B4 (white: Q W E R T Y U I O P, black: 2 3 5 6 7) &nbsp;|&nbsp; 8-voice polyphony</div>
+</div>
+
+<script>
+// ─── Constants ───
+const NM=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const freq=m=>440*Math.pow(2,(m-69)/12);
+const BASE=60; // C4
+
+// ─── Default patch ───
+let P={
+  ops:[
+    {r:1,l:0.7,e:{a:.01,d:.3,s:.2,r:.5},t:'sine'},
+    {r:1.5,l:0.5,e:{a:.01,d:.5,s:.1,r:.4},t:'sine'},
+    {r:2,l:0.3,e:{a:.01,d:.8,s:.05,r:.3},t:'sine'},
+    {r:0.5,l:0.2,e:{a:.05,d:1,s:.3,r:.6},t:'sine'},
+  ],
+  mods:[
+    {from:1,to:0,depth:2.0},
+    {from:2,to:0,depth:1.0},
+    {from:1,to:2,depth:0.5},
+  ],
+  g:{vol:0.5,flt:{t:'lowpass',f:12000,q:0.7}},
+};
+
+// ─── Audio setup ───
+let actx,mGain,filterN,analyser;
+const VOICE_N=8;
+const pool=Array.from({length:VOICE_N},()=>({on:false,st:0,v:null}));
+
+function init(){
+  if(actx)return;
+  actx=new(window.AudioContext||window.webkitAudioContext)();
+  mGain=actx.createGain();mGain.gain.value=P.g.vol;
+  filterN=actx.createBiquadFilter();
+  filterN.type=P.g.flt.t;filterN.frequency.value=P.g.flt.f;filterN.Q.value=P.g.flt.q;
+  analyser=actx.createAnalyser();analyser.fftSize=2048;
+  filterN.connect(mGain).connect(analyser).connect(actx.destination);
+  drawViz();
+}
+
+// ─── Voice ───
+class Voice{
+  constructor(){this.oscs=[];this.aeg=[];this.mdeg=[];this.sums=[];}
+
+  noteOn(baseFreq){
+    init();if(actx.state==='suspended')actx.resume();
+    const now=actx.currentTime;
+    const ops=P.ops,mods=P.mods;
+    const n=ops.length;
+
+    // Disconnect old nodes
+    for(const nd of [...this.oscs,...this.aeg,...this.mdeg,...this.sums]){
+      try{nd.disconnect();}catch(e){}
+    }
+    this.oscs=[];this.aeg=[];this.mdeg=[];this.sums=[];
+
+    // Create operator oscillators + amplitude envelope gains
+    for(let i=0;i<n;i++){
+      const o=actx.createOscillator();
+      o.type=ops[i].t;
+      o.frequency.value=baseFreq*ops[i].r;
+      this.oscs.push(o);
+
+      const g=actx.createGain();
+      this.aeg.push(g);
+    }
+
+    // Modulation depth gains (depth × baseFreq = modulation index)
+    for(const m of mods){
+      const mg=actx.createGain();
+      mg.gain.value=m.depth*baseFreq;
+      this.mdeg.push(mg);
+    }
+
+    // Summing nodes for carriers that receive modulation
+    const sumMap=new Map();
+    for(const m of mods){
+      if(!sumMap.has(m.to))sumMap.set(m.to,actx.createGain());
+    }
+    for(const[,s]of sumMap)this.sums.push(s);
+
+    // Wire FM chain: modulator osc → mod gain → sum → carrier frequency
+    for(let mi=0;mi<mods.length;mi++){
+      const m=mods[mi];
+      this.oscs[m.from].connect(this.mdeg[mi]);
+      this.mdeg[mi].connect(sumMap.get(m.to));
+    }
+    for(const[t,s]of sumMap)s.connect(this.oscs[t].frequency);
+
+    // Wire: osc → amplitude envelope gain
+    for(let i=0;i<n;i++)this.oscs[i].connect(this.aeg[i]);
+
+    // Carrier output (op 0) → global filter
+    this.aeg[0].connect(filterN);
+
+    // Amplitude envelope on carrier (op 0)
+    const e0=ops[0].e;
+    this.aeg[0].gain.setValueAtTime(0,now);
+    this.aeg[0].gain.linearRampToValueAtTime(ops[0].l,now+e0.a);
+    this.aeg[0].gain.setTargetAtTime(ops[0].l*e0.s,now+e0.a,e0.d);
+
+    // Amplitude envelopes on modulators
+    for(let i=1;i<n;i++){
+      const me=ops[i].e;
+      this.aeg[i].gain.setValueAtTime(0,now);
+      this.aeg[i].gain.linearRampToValueAtTime(ops[i].l,now+me.a);
+      this.aeg[i].gain.setTargetAtTime(ops[i].l*me.s,now+me.a,me.d);
+    }
+
+    // Start all oscillators
+    for(let i=0;i<n;i++)this.oscs[i].start();
+
+    this.st=now+e0.a+e0.d+e0.r;
+    for(let i=0;i<n;i++)this.oscs[i].stop(this.st+0.1);
+  }
+
+  noteOff(){
+    const now=actx.currentTime;
+    const e0=P.ops[0].e;
+    // Release carrier
+    this.aeg[0].gain.cancelScheduledValues(now);
+    this.aeg[0].gain.setValueAtTime(this.aeg[0].gain.value,now);
+    this.aeg[0].gain.linearRampToValueAtTime(0,now+e0.r);
+    // Release modulators with their own release times
+    for(let i=1;i<this.aeg.length;i++){
+      const me=P.ops[i].e;
+      this.aeg[i].gain.cancelScheduledValues(now);
+      this.aeg[i].gain.setValueAtTime(this.aeg[i].gain.value,now);
+      this.aeg[i].gain.linearRampToValueAtTime(0,now+me.r);
+    }
+    const stop=now+Math.max(e0.r,...P.ops.slice(1).map(o=>o.e.r))+0.1;
+    for(const o of this.oscs)o.stop(stop);
+  }
+}
+
+// ─── Polyphony ───
+function noteOn(midi){
+  init();
+  let idx=pool.findIndex(p=>!p.on);
+  if(idx<0){
+    // Steal oldest
+    let oldest=0;
+    for(let i=1;i<pool.length;i++){
+      if(pool[i].st<pool[oldest].st)oldest=i;
+    }
+    idx=oldest;
+    if(pool[idx].v)pool[idx].v.noteOff();
+  }
+  if(!pool[idx].v)pool[idx].v=new Voice();
+  pool[idx].v.noteOn(freq(midi));
+  pool[idx].on=true;
+  pool[idx].st=pool[idx].v.st;
+}
+
+// ─── Keyboard UI ───
+const kbEl=document.getElementById('kb');
+const WW=30;
+function buildKB(){
+  kbEl.innerHTML='';kbEl.style.width=(8*WW)+'px';
+  const bp=[1,0,1,0,1,1,0]; // C D E F G A B
+  for(let oct=0;oct<2;oct++){
+    for(let i=0;i<7;i++){
+      const m=BASE+oct*12+i;
+      const k=document.createElement('div');
+      k.className='k w';k.dataset.m=m;k.textContent=NM[i];
+      k.onpointerdown=()=>{k.classList.add('on');noteOn(m)};
+      k.onpointerup=k.onpointerleave=()=>k.classList.remove('on');
+      kbEl.appendChild(k);
+    }
+    const m=BASE+24;
+    const k=document.createElement('div');
+    k.className='k w';k.dataset.m=m;k.textContent='C';
+    k.onpointerdown=()=>{k.classList.add('on');noteOn(m)};
+    k.onpointerup=k.onpointerleave=()=>k.classList.remove('on');
+    kbEl.appendChild(k);
+  }
+  let wi=0;
+  for(let oct=0;oct<2;oct++){
+    for(let i=0;i<7;i++){
+      if(bp[i]){
+        const m=BASE+oct*12+i+1;
+        const k=document.createElement('div');
+        k.className='k b';k.dataset.m=m;
+        k.style.left=(wi*WW+WW*0.66)+'px';
+        k.onpointerdown=()=>{k.classList.add('on');noteOn(m)};
+        k.onpointerup=k.onpointerleave=()=>k.classList.remove('on');
+        kbEl.appendChild(k);
+      }else wi++;
+    }
+  }
+}
+buildKB();
+
+// ─── Computer keyboard ───
+const KM={z:0,s:1,x:2,d:3,c:4,v:5,g:6,b:7,h:8,n:9,j:10,m:11,
+          q:12,2:13,w:14,3:15,e:16,r:17,t:18,y:19,u:20,i:21,o:22,p:23};
+const pressed=new Set();
+document.addEventListener('keydown',e=>{
+  if(e.repeat||pressed.has(e.key))return;
+  const s=KM[e.key.toLowerCase()];if(s===undefined)return;
+  pressed.add(e.key);noteOn(BASE+s);
+  document.querySelector(`.k[data-m="${BASE+s}"]`)?.classList.add('on');
+});
+document.addEventListener('keyup',e=>{
+  pressed.delete(e.key);
+  document.querySelectorAll('.k.on').forEach(k=>k.classList.remove('on'));
+});
+
+// ─── Tabs & controls ───
+const tabsEl=document.getElementById('tabs');
+const ctrlEl=document.getElementById('ctrl');
+const sections=['ops','mods','global'];
+const labels=['Operators','Mod Matrix','Global'];
+
+function renderTabs(){
+  tabsEl.innerHTML='';
+  sections.forEach((s,i)=>{
+    const b=document.createElement('div');
+    b.className='tab'+(i===0?' active':'');
+    b.textContent=labels[i];
+    b.onclick=()=>{
+      tabsEl.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+      b.classList.add('active');
+      renderSection(s);
+    };
+    tabsEl.appendChild(b);
+  });
+  renderSection('ops');
+}
+
+function slider(parent,label,min,max,step,val,fmt,cb){
+  const d=document.createElement('div');d.className='row';
+  d.innerHTML=`<label>${label}</label><input type="range" min="${min}" max="${max}" step="${step}" value="${val}"><span class="val">${fmt(val)}</span>`;
+  const inp=d.querySelector('input'),sp=d.querySelector('.val');
+  inp.oninput=()=>{const v=parseFloat(inp.value);cb(v);sp.textContent=fmt(v)};
+  parent.appendChild(d);
+}
+
+function renderSection(sec){
+  ctrlEl.innerHTML='';
+  if(sec==='ops'){
+    P.ops.forEach((op,i)=>{
+      const c=document.createElement('div');c.className='card';
+      const h=document.createElement('h3');h.textContent=`Operator ${i} [${op.t}]`;c.appendChild(h);
+
+      slider(c,'Ratio',0.1,10,0.1,op.r,v=>v.toFixed(1),v=>op.r=v);
+      slider(c,'Level',0,1,0.01,op.l,v=>v.toFixed(2),v=>op.l=v);
+      slider(c,'Attack',0.001,2,0.001,op.e.a,v=>v.toFixed(3),v=>op.e.a=v);
+      slider(c,'Decay',0.01,3,0.01,op.e.d,v=>v.toFixed(2),v=>op.e.d=v);
+      slider(c,'Sustain',0,1,0.01,op.e.s,v=>v.toFixed(2),v=>op.e.s=v);
+      slider(c,'Release',0.01,5,0.01,op.e.r,v=>v.toFixed(2),v=>op.e.r=v);
+
+      const sel=document.createElement('select');
+      ['sine','triangle','sawtooth','square'].forEach(t=>{
+        const o=document.createElement('option');o.value=t;o.textContent=t;o.selected=t===op.t;c.appendChild(o);
+      });
+      sel.onchange=()=>{op.t=sel.value;c.querySelector('h3').textContent=`Operator ${i} [${op.t}]`};
+      c.appendChild(sel);
+      ctrlEl.appendChild(c);
+    });
+  }else if(sec==='mods'){
+    P.mods.forEach((m,i)=>{
+      const c=document.createElement('div');c.className='card';
+      const h=document.createElement('h3');h.textContent=`Mod ${i}: Op${m.from} → Op${m.to}`;c.appendChild(h);
+      slider(c,'Depth',0,10,0.01,m.depth,v=>v.toFixed(2),v=>m.depth=v);
+      ctrlEl.appendChild(c);
+    });
+    const add=document.createElement('div');add.className='card';
+    add.innerHTML='<h3>+ Add Mod</h3>';
+    const btn=document.createElement('button');
+    btn.textContent='Add Modulation';
+    btn.style.cssText='padding:8px;border:none;border-radius:6px;background:#7faaff;color:#000;cursor:pointer;width:100%';
+    btn.onclick=()=>{
+      if(P.mods.length<8){
+        P.mods.push({from:Math.floor(Math.random()*4),to:Math.floor(Math.random()*4),depth:1});
+        renderSection('mods');
+      }
+    };
+    add.appendChild(btn);ctrlEl.appendChild(add);
+  }else{
+    const c=document.createElement('div');c.className='card';
+    c.innerHTML='<h3>Global</h3>';
+    slider(c,'Volume',0,1,0.01,P.g.vol,v=>v.toFixed(2),v=>{P.g.vol=v;if(mGain)mGain.gain.value=v});
+    slider(c,'Filter',100,20000,100,P.g.flt.f,v=>v+'Hz',v=>{P.g.flt.f=v;if(filterN)filterN.frequency.value=v});
+    slider(c,'Resonance',0.1,20,0.1,P.g.flt.q,v=>v.toFixed(1),v=>{P.g.flt.q=v;if(filterN)filterN.Q.value=v});
+    const sel=document.createElement('select');
+    ['lowpass','highpass','bandpass'].forEach(t=>{
+      const o=document.createElement('option');o.value=t;o.textContent=t;o.selected=t===P.g.flt.t;c.appendChild(o);
+    });
+    sel.onchange=()=>{P.g.flt.t=sel.value;if(filterN)filterN.type=sel.value};
+    c.appendChild(sel);ctrlEl.appendChild(c);
+  }
+}
+
+// ─── Visualizer ───
+const cv=document.getElementById('viz'),cx=cv.getContext('2d');
+function drawViz(){
+  cv.width=cv.offsetWidth*2;cv.height=cv.offsetHeight*2;
+  const d=new Uint8Array(1024);
+  (function loop(){
+    requestAnimationFrame(loop);
+    if(!analyser)return;
+    analyser.getByteTimeDomainData(d);
+    cx.fillStyle='#08080f';cx.fillRect(0,0,cv.width,cv.height);
+    cx.lineWidth=2;cx.strokeStyle='#7faaff';cx.beginPath();
+    const sw=cv.width/d.length;let x=0;
+    for(let i=0;i<d.length;i++){const y=d[i]/256*cv.height;i===0?cx.moveTo(x,y):cx.lineTo(x,y);x+=sw}
+    cx.stroke();
+  })();
+}
+
+renderTabs();
+</script>
+</body>
+</html>

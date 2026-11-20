@@ -1,4 +1,4 @@
-"""Conditional Flow Matching: training loss + ODE samplers.
+"""Conditional Flow Matching: training losses + chunk-by-chunk ODE samplers.
 
 We use the **rectified-flow / linear** CFM path:
 
@@ -8,19 +8,24 @@ with target velocity
 
     v_target = dx/dt = eps - x_data
 
-Time `t` is sampled per-sample from a logit-normal distribution
-(SD3 schedule, Esser et al. 2024) which empirically gives faster convergence
-than uniform sampling, with an option for plain uniform `t` for small
-datasets where coverage of the tails matters more than concentration.
+Two training objectives:
 
-For continuation training we use a **per-token noise level**: prefix tokens
-sit at `t=0` (clean) while target tokens carry a noise level `t ∈ (0, 1]`. The
-loss is computed only on target tokens.
+- `cfm_loss` (joint, default): a clean prefix followed by a target span
+  denoised jointly at one shared noise level.
+- `teacher_forcing_loss`: the model sees [clean crop ; noisy crop] and noisy
+  chunk i attends to clean chunks < i and to itself, so every chunk is trained
+  in exactly the condition realtime generates it in, each with its own noise
+  level. Learns the realtime condition much faster but overfits small datasets
+  sooner (see README).
+
+Two samplers: `generate` works chunk by chunk with a sliding window of clean
+context (as realtime does; any length), `sample_joint` denoises a whole
+continuation at once (the joint objective's condition; up to max_seq_len).
 
 Latent normalization is handled by `model.normalize` / `model.denormalize`:
-`cfm_loss` operates entirely in the model's normalized space (so the noise
-`eps ~ N(0, I)` matches the boundary condition at `t=1`), and `sample` returns
-latents in the original codec space ready to be fed to the decoder.
+losses operate in the model's normalized space (so the noise `eps ~ N(0, I)`
+matches the boundary condition at `t=1`), and the samplers return latents in
+the original codec space ready to be fed to the decoder.
 """
 
 from __future__ import annotations
@@ -28,12 +33,9 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
-import torch.nn.functional as F
-
-from ..utils import block_causal_mask
 
 
 # --------------------------------------------------------------------------- #
@@ -88,8 +90,17 @@ def sample_prefix_chunks(
     return random.randint(min_chunks, max_chunks)
 
 
+def min_snr_weight(t: torch.Tensor, gamma: float) -> torch.Tensor:
+    """Min-SNR-γ weight for v-prediction (Hang et al. 2023, eq. 7) on the
+    rectified-flow path: alpha=1-t, sigma=t -> SNR = (1-t)^2 / t^2,
+    w = min(SNR, γ) / (SNR + 1)."""
+    t = t.clamp(min=1e-3, max=1.0 - 1e-3)
+    snr = (1.0 - t).pow(2) / t.pow(2)
+    return snr.clamp(max=float(gamma)) / (snr + 1.0)
+
+
 # --------------------------------------------------------------------------- #
-# Training loss
+# Training losses
 # --------------------------------------------------------------------------- #
 
 @dataclass
@@ -109,7 +120,7 @@ def cfm_loss(
     attn_mask: Optional[torch.Tensor] = None,
     min_snr_gamma: Optional[float] = None,
 ) -> CFMOutputs:
-    """One CFM training step (loss only, no optim).
+    """Joint objective: one CFM training step (loss only, no optim).
 
     Args:
         model: a `FlowDiT` (provides `.normalize` / `.denormalize` and
@@ -117,13 +128,11 @@ def cfm_loss(
         x_data: [B, L, D] clean target in **raw codec-latent space**. The
             model normalizes internally; this function takes raw latents to
             keep the dataloader simple.
-        prefix_len: number of leading tokens to keep clean (per-batch scalar).
+        prefix_len: number of leading tokens to keep clean (per-batch scalar,
+            a multiple of block_size).
         t_sample: [B] sampled noise levels in [0, 1].
         attn_mask: optional precomputed [L, L] additive mask.
-        min_snr_gamma: if set, applies Min-SNR-γ loss weighting (Hang et al.
-            2023) per-batch sample. The weights are renormalized so the
-            mean over a batch is 1, which keeps the magnitude comparable to
-            the unweighted MSE for logging.
+        min_snr_gamma: if set, applies Min-SNR-γ loss weighting per sample.
     """
     # Move into normalized space so v_target = eps - x is well-conditioned
     # and the boundary condition at t=1 is exactly N(0, I).
@@ -148,9 +157,6 @@ def cfm_loss(
 
     v_target = eps - x_data  # rectified flow velocity
 
-    if attn_mask is None:
-        attn_mask = block_causal_mask(L, model.block_size, device=device).to(x_data.dtype)
-
     v_pred = model(x_t, t_per_token, attn_mask=attn_mask)
 
     # MSE per token, masked to target positions only.
@@ -158,17 +164,9 @@ def cfm_loss(
     weighted_mask = target_mask
 
     if min_snr_gamma is not None and min_snr_gamma > 0:
-        # For rectified flow: alpha=1-t, sigma=t -> SNR = (1-t)^2 / t^2.
-        # For v-prediction the optimal MSE weighting is
-        #   w(t) = min(SNR, gamma) / (SNR + 1)
-        # (Hang et al. 2023, eq. 7 specialized to v-pred). We renormalize so
-        # the expected weight over the batch is 1, otherwise the reported
-        # loss number changes meaning.
-        t_for_w = t_sample.clamp(min=1e-3, max=1.0 - 1e-3)
-        snr = (1.0 - t_for_w).pow(2) / t_for_w.pow(2)
-        w = torch.minimum(snr, snr.new_full(snr.shape, float(min_snr_gamma))) / (snr + 1.0)
-        w = w / w.mean().clamp(min=1e-6)
-        weighted_mask = target_mask * w.view(B, 1)
+        # Renormalized to mean 1 so the logged loss keeps its meaning.
+        w = min_snr_weight(t_sample, min_snr_gamma)
+        weighted_mask = target_mask * (w / w.mean().clamp(min=1e-6)).view(B, 1)
 
     denom = weighted_mask.sum().clamp(min=1.0)
     loss = (sq * weighted_mask).sum() / denom
@@ -182,6 +180,49 @@ def cfm_loss(
     )
 
 
+def teacher_forcing_loss(
+    model,
+    x_data: torch.Tensor,
+    t_chunk: torch.Tensor,
+    attn_mask: torch.Tensor,
+    min_snr_gamma: Optional[float] = None,
+    eps: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Block-diffusion loss in the exact generation condition (cf. Arriola et al.
+    2025, "Block Diffusion").
+
+    The model sees [clean crop ; noisy crop] (2L tokens, RoPE positions repeated)
+    under `utils.teacher_forcing_mask`: noisy chunk i attends to clean chunks < i
+    and to itself, i.e. clean context -> one noisy chunk, for every chunk.
+
+    Args:
+        x_data: [B, L, D] clean crop in raw codec space.
+        t_chunk: [B, L // block_size] independent noise level per chunk.
+        attn_mask: `teacher_forcing_mask(L, block_size)`, shape [2L, 2L].
+        eps: optional fixed noise (deterministic validation).
+    Returns:
+        Scalar loss over the noisy half.
+    """
+    x = model.normalize(x_data)
+    B, L, _ = x.shape
+    t = t_chunk.repeat_interleave(model.block_size, dim=1)  # [B, L]
+    if eps is None:
+        eps = torch.randn_like(x)
+    x_t = (1.0 - t.unsqueeze(-1)) * x + t.unsqueeze(-1) * eps
+    pos = torch.arange(L, device=x.device).repeat(2)
+    v_pred = model(
+        torch.cat([x, x_t], dim=1),
+        torch.cat([torch.zeros_like(t), t], dim=1),
+        attn_mask=attn_mask,
+        pos=pos,
+    )[:, L:]
+    sq = (v_pred.float() - (eps - x)).pow(2).mean(dim=-1)  # [B, L]
+    if min_snr_gamma:
+        w = min_snr_weight(t, min_snr_gamma)
+        return (sq * w).sum() / w.sum().clamp(min=1e-6)
+    return sq.mean()
+
+
 # --------------------------------------------------------------------------- #
 # ODE / SDE samplers (inference)
 # --------------------------------------------------------------------------- #
@@ -191,291 +232,160 @@ def cfm_loss(
 # backwards from t=1 to t=0 with dt = t_next - t_curr (< 0):
 #
 #     x(t_next) = x(t_curr) + dt * v(x, t_curr)              (Euler)
-#
-# Higher-order solvers (Heun / midpoint / RK4) follow the standard explicit
-# Runge-Kutta updates. DPM-Solver++ uses the closed-form rectified-flow
-# update with optional second-order Richardson extrapolation. Ping-pong is
-# a stochastic SDE-style sampler best suited to distilled models.
 
 SUPPORTED_SOLVERS = ("euler", "heun", "midpoint", "rk4", "dpmpp", "pingpong")
 SUPPORTED_SCHEDULES = ("linear", "shifted")
 
 
-def _build_schedule(
-    n_steps: int,
-    schedule: str,
-    schedule_shift: float,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Return a 1D tensor of shape (n_steps + 1,) with t in [0, 1] from 1 -> 0.
+def build_schedule(n_steps: int, schedule: str = "linear", schedule_shift: float = 0.0) -> list:
+    """(n_steps + 1) noise levels from 1.0 (noise) to 0.0 (data), as floats.
 
-    Args:
-        schedule: 'linear' (uniform) or 'shifted' (sigmoid logSNR shift -- a
-            positive `schedule_shift` allocates more steps near t=1, useful
-            for long sequences; a negative value crowds steps near t=0).
-        schedule_shift: shift exponent in log-SNR space. Equivalent to the
-            time-shifting trick used in SD3 / Stable Audio 3.
+    'shifted' applies the SD3 / Stable Audio logSNR shift
+    t' = mu*t / (1 + (mu - 1)*t), mu = exp(shift): a positive shift spends more
+    steps near t=1, a negative one near t=0.
     """
-    t = torch.linspace(1.0, 0.0, n_steps + 1, device=device, dtype=torch.float32)
-    if schedule == "linear":
-        pass
-    elif schedule == "shifted":
-        if schedule_shift != 0.0:
-            # Apply a logSNR shift: t' = mu*t / (1 + (mu - 1) * t) with mu = exp(shift).
-            # mu > 1 pushes mass toward t=1 (more denoising near pure noise).
-            mu = float(math.exp(schedule_shift))
-            # Avoid division issues at exact 0/1.
-            t_clamped = t.clamp(min=1e-6, max=1.0 - 1e-6)
-            t_shifted = mu * t_clamped / (1.0 + (mu - 1.0) * t_clamped)
-            t = torch.where(t > 0.999999, t.new_tensor(1.0), t_shifted)
-            t = torch.where(t < 1e-6, t.new_tensor(0.0), t)
-    else:
+    if schedule not in SUPPORTED_SCHEDULES:
         raise ValueError(f"unknown schedule: {schedule!r} (expected one of {SUPPORTED_SCHEDULES})")
-    return t.to(dtype)
+    n = max(1, int(n_steps))
+    ts = [1.0 - k / n for k in range(n + 1)]
+    if schedule == "shifted" and schedule_shift != 0.0:
+        mu = math.exp(schedule_shift)
+        ts = [t if t in (0.0, 1.0) else mu * t / (1.0 + (mu - 1.0) * t) for t in ts]
+    return ts
+
+
+def _log_snr(t: float) -> float:
+    return math.log(max(1.0 - t, 1e-10) / max(t, 1e-10))
 
 
 @torch.no_grad()
-def sample(
+def integrate(x: torch.Tensor, ts: list, velocity, solver: str = "heun", temperature: float = 1.0) -> torch.Tensor:
+    """Solve from noise (ts[0] = 1) to data (ts[-1] = 0).
+
+    `velocity(x, t)` returns the model velocity for state x at noise level t.
+    `temperature` scales it (v / temperature): 1 is the plain ODE, <1 overshoots
+    toward the data, >1 leaves residual noise. Solvers: euler (1 model call per
+    step), heun / midpoint (2), rk4 (4), dpmpp (DPM-Solver++ 2M, 1), pingpong
+    (stochastic, 1; best for distilled models).
+
+    Heun and RK4 take a plain Euler step into t=0: t=0 is the clean-context
+    level, which never receives a loss, so the velocity there is untrained.
+    """
+    if solver not in SUPPORTED_SOLVERS:
+        raise ValueError(f"unknown solver: {solver!r} (expected one of {SUPPORTED_SOLVERS})")
+    inv_temp = 1.0 / max(1e-6, float(temperature))
+
+    def vel(state, t):
+        return velocity(state, t) * inv_temp
+
+    prev_den = None
+    for i in range(len(ts) - 1):
+        t0, t1 = ts[i], ts[i + 1]
+        dt = t1 - t0
+        if solver == "euler" or (t1 == 0.0 and solver in ("heun", "rk4")):
+            x = x + dt * vel(x, t0)
+        elif solver == "heun":
+            k1 = vel(x, t0)
+            x = x + 0.5 * dt * (k1 + vel(x + dt * k1, t1))
+        elif solver == "midpoint":
+            x = x + dt * vel(x + 0.5 * dt * vel(x, t0), t0 + 0.5 * dt)
+        elif solver == "rk4":
+            tm = t0 + 0.5 * dt
+            k1 = vel(x, t0)
+            k2 = vel(x + 0.5 * dt * k1, tm)
+            k3 = vel(x + 0.5 * dt * k2, tm)
+            k4 = vel(x + dt * k3, t1)
+            x = x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        else:
+            den = x - t0 * vel(x, t0)  # x_data prediction
+            if solver == "pingpong":
+                # Denoise, then re-noise to t1 with fresh noise.
+                x = (1.0 - t1) * den + t1 * torch.randn_like(den) if t1 > 0.0 else den
+            else:
+                # DPM-Solver++ 2M for rectified flow (as in Stable Audio's
+                # sample_flow_dpmpp): second-order multistep correction in
+                # log-SNR space, first order on the first and last step.
+                use = den
+                if prev_den is not None and t1 > 0.0:
+                    h = _log_snr(t1) - _log_snr(t0)
+                    r = (_log_snr(t0) - _log_snr(ts[i - 1])) / h if h != 0.0 else 0.0
+                    if r != 0.0:
+                        use = (1.0 + 1.0 / (2.0 * r)) * den - (1.0 / (2.0 * r)) * prev_den
+                x = (t1 / t0) * x + (1.0 - t1 / t0) * use
+                prev_den = den
+    return x
+
+
+@torch.no_grad()
+def generate_chunk(
+    model,
+    context: torch.Tensor,
+    n_steps: int,
+    solver: str = "euler",
+    temperature: float = 1.0,
+    schedule: str = "linear",
+    schedule_shift: float = 0.0,
+    noise: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Generate one chunk (`block_size` tokens) after a clean `context`.
+
+    Both in normalized space: context [B, P, D] (P a multiple of block_size,
+    may be 0) -> chunk [B, block_size, D]. The context goes through the model
+    once and its per-layer K/V are cached; each solver step then runs only the
+    new chunk's tokens. Exact: under block-causal attention the context never
+    sees the chunk being generated.
+    """
+    B, P, D = context.shape
+    bs = model.block_size
+    x = torch.randn(B, bs, D, device=context.device, dtype=context.dtype) if noise is None else noise
+    kv = model(context, context.new_zeros(B, P), return_kv=True)[1] if P > 0 else None
+
+    def velocity(state, t):
+        return model(state, state.new_full((B, bs), t), kv=kv)
+
+    return integrate(x, build_schedule(n_steps, schedule, schedule_shift), velocity, solver, temperature)
+
+
+@torch.no_grad()
+def sample_joint(
     model,
     prefix: torch.Tensor,
     n_target_tokens: int,
     n_steps: int,
     solver: str = "heun",
-    eta: float = 0.0,
+    temperature: float = 1.0,
     schedule: str = "linear",
     schedule_shift: float = 0.0,
 ) -> torch.Tensor:
-    """Sample `n_target_tokens` continuation tokens given a clean `prefix`.
+    """Denoise the whole continuation at once after a clean `prefix` (the
+    `joint` objective's condition). Prompt + continuation must fit
+    `max_seq_len`; use `generate` for longer output.
 
-    Args:
-        model: trained FlowDiT.
-        prefix: [B, P, D] clean prompt latents in **raw codec space**
-                (P may be 0 for unconditional generation).
-        n_target_tokens: number of tokens to generate (must be a multiple of
-            `model.block_size`).
-        n_steps: number of ODE/SDE steps (NFE counted as model evaluations
-            depends on the solver: euler=1, heun/midpoint=2, rk4=4, dpmpp=1,
-            pingpong=1 per step).
-        solver: one of `SUPPORTED_SOLVERS`:
-            - 'euler'    : 1st-order ODE (1 NFE/step). Fastest baseline.
-            - 'heun'     : 2nd-order ODE (2 NFE/step). Default; good quality.
-            - 'midpoint' : 2nd-order RK2 (2 NFE/step). Often slightly cleaner
-              than Heun on RF.
-            - 'rk4'      : 4th-order Runge-Kutta (4 NFE/step). Highest quality
-              for low step counts.
-            - 'dpmpp'    : DPM-Solver++ 2M for rectified flow (1 NFE/step,
-              uses 2nd-order Richardson extrapolation across consecutive
-              steps). Strong quality at very low NFE (4-8).
-            - 'pingpong' : stochastic SDE sampler (1 NFE/step). Recommended
-              only for distilled / few-step models.
-        eta: stochasticity level (currently only consumed by 'pingpong'
-            implicitly through re-noising; kept for API compatibility).
-        schedule: 'linear' or 'shifted' time grid (see `_build_schedule`).
-        schedule_shift: logSNR shift applied when `schedule='shifted'`.
-
-    Returns:
-        Tensor [B, P + n_target_tokens, D] in **raw codec space**, ready to
-        feed into `CodecWrapper.decode_latents`.
+    prefix: [B, P, D] raw codec latents (P may be 0). Returns raw [B, P + T, D].
     """
-    if solver not in SUPPORTED_SOLVERS:
-        raise ValueError(f"unknown solver: {solver!r} (expected one of {SUPPORTED_SOLVERS})")
-    assert n_target_tokens % model.block_size == 0, (
-        f"n_target_tokens={n_target_tokens} must be a multiple of block_size={model.block_size}"
-    )
-    device = next(model.parameters()).device
-    dtype = next(model.parameters()).dtype
+    B, P, D = prefix.shape
+    ctx = model.normalize(prefix)
+    t_tok = torch.cat([prefix.new_zeros(B, P), prefix.new_ones(B, n_target_tokens)], dim=1)
 
-    if prefix is None:
-        B = 1
-        prefix = torch.zeros(B, 0, model.latent_dim, device=device, dtype=dtype)
-    elif prefix.dim() == 3 and prefix.shape[1] == 0:
-        # Empty prefix with explicit batch dim -> unconditional, B from caller.
-        B = prefix.shape[0]
-        prefix = prefix.to(device=device, dtype=dtype)
-    else:
-        prefix = prefix.to(device=device, dtype=dtype)
-        B = prefix.shape[0]
+    def velocity(state, t):
+        return model(torch.cat([ctx, state], dim=1), t_tok * t)[:, P:]
 
-    P = prefix.shape[1]
-    L = P + n_target_tokens
-    if L > model.max_seq_len:
-        raise ValueError(f"L={L} > max_seq_len={model.max_seq_len}")
-
-    # Normalize the prefix so the model sees a unit-Gaussian-distributed
-    # observation for the clean tokens. The target noise is N(0, I) which
-    # matches the boundary t=1 of the *normalized* path.
-    if P > 0:
-        prefix_norm = model.normalize(prefix)
-    else:
-        prefix_norm = prefix
-
-    target_noise = torch.randn(B, n_target_tokens, model.latent_dim, device=device, dtype=dtype)
-    x = torch.cat([prefix_norm, target_noise], dim=1)  # [B, L, D] in normalized space
-
-    attn_mask = block_causal_mask(L, model.block_size, device=device).to(dtype)
-
-    is_target = torch.arange(L, device=device) >= P  # [L]
-
-    def t_per_token(t_now: float) -> torch.Tensor:
-        return is_target.float().unsqueeze(0).expand(B, -1) * t_now
-
-    def velocity(state: torch.Tensor, t_now: float) -> torch.Tensor:
-        """Evaluate the model and return v restricted to target tokens.
-
-        The prefix tokens are kept clean (t=0) so the model sees a fully
-        consistent block-causal context.
-        """
-        return model(state, t_per_token(t_now), attn_mask=attn_mask)
-
-    schedule_t = _build_schedule(n_steps, schedule, schedule_shift, device=device, dtype=torch.float32)
-
-    if solver == "dpmpp":
-        x = _sample_dpmpp(x, P, schedule_t, velocity)
-    elif solver == "pingpong":
-        x = _sample_pingpong(x, P, schedule_t, velocity)
-    else:
-        x = _sample_rk(x, P, schedule_t, velocity, solver=solver)
-
-    # Denormalize so the output sits in the codec's expected space.
-    return model.denormalize(x)
+    x = torch.randn(B, n_target_tokens, D, device=prefix.device, dtype=prefix.dtype)
+    x = integrate(x, build_schedule(n_steps, schedule, schedule_shift), velocity, solver, temperature)
+    return model.denormalize(torch.cat([ctx, x], dim=1))
 
 
-def _apply_target_update(x: torch.Tensor, P: int, delta: torch.Tensor) -> torch.Tensor:
-    """Return a new tensor where target tokens (>= P) are replaced by delta."""
-    out = x.clone()
-    out[:, P:] = delta
-    return out
+@torch.no_grad()
+def generate(model, prefix: torch.Tensor, n_chunks: int, context_chunks: int = 32, **kw) -> torch.Tensor:
+    """Continue `prefix` chunk by chunk with a sliding context window (as realtime does).
 
-
-def _sample_rk(
-    x: torch.Tensor,
-    P: int,
-    schedule_t: torch.Tensor,
-    velocity,
-    solver: str,
-) -> torch.Tensor:
-    """Explicit Runge-Kutta family: euler, heun, midpoint, rk4.
-
-    Updates only target tokens (positions >= P). Prefix tokens are kept clean
-    via the `velocity` closure (which sets t=0 for the prefix).
+    prefix: [B, P, D] raw codec latents (P a multiple of block_size; may be 0).
+    kw: forwarded to `generate_chunk` (n_steps, solver, temperature, schedule, ...).
+    Returns raw latents [B, P + n_chunks * block_size, D].
     """
-    n_steps = schedule_t.shape[0] - 1
-    for i in range(n_steps):
-        t_curr = float(schedule_t[i].item())
-        t_next = float(schedule_t[i + 1].item())
-        dt = t_next - t_curr  # negative
-
-        if solver == "euler":
-            k1 = velocity(x, t_curr)
-            x = _apply_target_update(x, P, x[:, P:] + dt * k1[:, P:])
-        elif solver == "heun":
-            k1 = velocity(x, t_curr)
-            x_pred = _apply_target_update(x, P, x[:, P:] + dt * k1[:, P:])
-            k2 = velocity(x_pred, t_next)
-            x = _apply_target_update(x, P, x[:, P:] + 0.5 * dt * (k1[:, P:] + k2[:, P:]))
-        elif solver == "midpoint":
-            t_mid = t_curr + 0.5 * dt
-            k1 = velocity(x, t_curr)
-            x_mid = _apply_target_update(x, P, x[:, P:] + 0.5 * dt * k1[:, P:])
-            k2 = velocity(x_mid, t_mid)
-            x = _apply_target_update(x, P, x[:, P:] + dt * k2[:, P:])
-        elif solver == "rk4":
-            t_mid = t_curr + 0.5 * dt
-            k1 = velocity(x, t_curr)
-            x2 = _apply_target_update(x, P, x[:, P:] + 0.5 * dt * k1[:, P:])
-            k2 = velocity(x2, t_mid)
-            x3 = _apply_target_update(x, P, x[:, P:] + 0.5 * dt * k2[:, P:])
-            k3 = velocity(x3, t_mid)
-            x4 = _apply_target_update(x, P, x[:, P:] + dt * k3[:, P:])
-            # Avoid evaluating the model at exactly t=0 (not seen in training).
-            t_eval = max(t_next, 1e-5)
-            k4 = velocity(x4, t_eval)
-            update = (dt / 6.0) * (k1[:, P:] + 2.0 * k2[:, P:] + 2.0 * k3[:, P:] + k4[:, P:])
-            x = _apply_target_update(x, P, x[:, P:] + update)
-        else:
-            raise ValueError(f"unknown RK solver: {solver}")
-    return x
-
-
-def _sample_dpmpp(
-    x: torch.Tensor,
-    P: int,
-    schedule_t: torch.Tensor,
-    velocity,
-) -> torch.Tensor:
-    """DPM-Solver++ 2M for rectified flow.
-
-    Closed-form rectified-flow update with second-order Richardson
-    extrapolation across consecutive steps. Mirrors the implementation in
-    Stability-AI/stable-audio-3 (`sample_flow_dpmpp`).
-    """
-    eps = 1e-10
-    n_steps = schedule_t.shape[0] - 1
-    old_denoised = None
-    log_snr = lambda t: math.log(max(1.0 - t, eps) / max(t, eps))
-
-    for i in range(n_steps):
-        t_curr = float(schedule_t[i].item())
-        t_next = float(schedule_t[i + 1].item())
-        t_prev = float(schedule_t[i - 1].item()) if i > 0 else None
-
-        v = velocity(x, t_curr)
-        # x_data prediction in normalized space: denoised = x - t * v.
-        denoised = x[:, P:] - t_curr * v[:, P:]
-
-        alpha_t = 1.0 - t_next
-        # Closed-form coefficient: dt / [(1 - t_next) * t_curr], matches
-        # (-h).expm1() in log-SNR formulation but avoids numerical issues.
-        denom = max(1.0 - t_next, eps) * max(t_curr, eps)
-        dpmpp_coeff = (t_next - t_curr) / denom
-
-        is_first_step = old_denoised is None
-        is_last_step = (t_next == 0.0)
-
-        if is_first_step or is_last_step:
-            denoised_use = denoised
-        else:
-            # Second-order multistep correction in log-SNR space.
-            h = log_snr(t_next) - log_snr(t_curr)
-            h_last = log_snr(t_curr) - log_snr(t_prev)  # type: ignore[arg-type]
-            r = h_last / h if h != 0.0 else 0.0
-            if r == 0.0:
-                denoised_use = denoised
-            else:
-                denoised_use = (1.0 + 1.0 / (2.0 * r)) * denoised - (1.0 / (2.0 * r)) * old_denoised
-
-        scale = t_next / max(t_curr, eps)
-        target_new = scale * x[:, P:] - alpha_t * dpmpp_coeff * denoised_use
-        x = _apply_target_update(x, P, target_new)
-        old_denoised = denoised
-    return x
-
-
-def _sample_pingpong(
-    x: torch.Tensor,
-    P: int,
-    schedule_t: torch.Tensor,
-    velocity,
-) -> torch.Tensor:
-    """Ping-pong (SDE) sampler for rectified flow.
-
-    Each step denoises to x_data (using the current velocity) and then
-    re-noises with fresh Gaussian noise to the next noise level. Best suited
-    to distilled / few-step models (Stable Audio 3 uses this for its
-    consistency-distilled checkpoint).
-    """
-    n_steps = schedule_t.shape[0] - 1
-    for i in range(n_steps):
-        t_curr = float(schedule_t[i].item())
-        t_next = float(schedule_t[i + 1].item())
-
-        v = velocity(x, t_curr)
-        denoised = x[:, P:] - t_curr * v[:, P:]
-        if t_next > 0.0:
-            new_noise = torch.randn_like(denoised)
-            target_new = (1.0 - t_next) * denoised + t_next * new_noise
-        else:
-            target_new = denoised
-        x = _apply_target_update(x, P, target_new)
-    return x
+    ctx = context_chunks * model.block_size
+    seq = model.normalize(prefix)
+    for _ in range(n_chunks):
+        chunk = generate_chunk(model, seq[:, max(0, seq.shape[1] - ctx):], **kw)
+        seq = torch.cat([seq, chunk], dim=1)
+    return model.denormalize(seq)

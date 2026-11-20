@@ -65,6 +65,24 @@ def block_causal_mask(seq_len: int, block_size: int, device: torch.device | str 
     return mask
 
 
+def teacher_forcing_mask(seq_len: int, block_size: int, device: torch.device | str = "cpu") -> torch.Tensor:
+    """Additive `[2L, 2L]` mask for teacher-forced training on `[clean ; noisy]`.
+
+    Clean tokens attend block-causally among themselves. A noisy token in chunk
+    i attends to clean chunks < i and to its own noisy chunk: exactly what the
+    model sees when generating chunk i from a clean context.
+    """
+    blk = torch.arange(seq_len, device=device) // block_size
+    q, k = blk.unsqueeze(1), blk.unsqueeze(0)
+    allowed = torch.cat([
+        torch.cat([k <= q, torch.zeros_like(k <= q)], dim=1),  # clean queries
+        torch.cat([k < q, k == q], dim=1),                      # noisy queries
+    ], dim=0)
+    mask = torch.zeros(allowed.shape, device=device, dtype=torch.float32)
+    mask.masked_fill_(~allowed, float("-inf"))
+    return mask
+
+
 # ---------------------------------------------------------------------------
 # Reproducibility / logging
 # ---------------------------------------------------------------------------
@@ -78,17 +96,18 @@ def set_seed(seed: int) -> None:
 
 
 def get_logger(name: str = "flow", level: int = logging.INFO) -> logging.Logger:
-    logger = logging.getLogger(name)
-    if logger.handlers:
-        return logger
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(
-        logging.Formatter("[%(asctime)s] %(name)s %(levelname)s: %(message)s", "%H:%M:%S")
-    )
-    logger.addHandler(handler)
-    logger.setLevel(level)
-    logger.propagate = False
-    return logger
+    # One console handler on the package logger; `flow.*` children propagate to it,
+    # so redirecting it (tqdm in train.py, stderr in server.py) covers every module.
+    root = logging.getLogger("flow")
+    if not root.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(
+            logging.Formatter("[%(asctime)s] %(name)s %(levelname)s: %(message)s", "%H:%M:%S")
+        )
+        root.addHandler(handler)
+        root.setLevel(level)
+        root.propagate = False
+    return logging.getLogger(name)
 
 
 def count_params(module: torch.nn.Module) -> int:

@@ -95,6 +95,9 @@ class CodecWrapper:
         # chunk, which we reshape to `tokens_per_chunk` x `desired_channels`.
         assert self.cfg.desired_channels % bottleneck_channels == 0
         self.tokens_per_chunk: int = num_latents * bottleneck_channels // self.cfg.desired_channels
+        # STFT frames are fac*hop long with stride hop (no centering): a segment needs
+        # this many extra samples past its last whole chunk to fill that chunk's frames.
+        self.frame_overlap: int = (fac - 1) * hop
 
         logger.info(
             "Codec ready: sr=%d, chunk=%d samples (%.3fs), tokens/chunk=%d, channels=%d",

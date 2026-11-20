@@ -30,9 +30,24 @@ chunks are temporally ordered. The most natural attention pattern is therefore:
 - **Bidirectional** within a chunk.
 - **Causal** across chunks.
 
-This matches the codec's own decoder mask, supports chunk-wise KV-caching at
-inference, and gives the model a direct one-chunk-ahead inductive bias for
-continuation.
+This matches the codec's own decoder mask, enables chunk-wise KV caching at
+inference (the clean context runs once per generated chunk; the solver steps
+only run the new chunk), and gives the model a direct one-chunk-ahead
+inductive bias for continuation.
+
+### Training objectives
+
+`joint` (default): a clean prefix plus a target span denoised jointly at one
+noise level. Only the first target chunk of each crop sees the realtime
+condition (clean context -> one noisy chunk).
+
+`teacher_forcing` (`--objective teacher_forcing`): the model sees
+`[clean crop ; noisy crop]` and noisy chunk i attends to clean chunks < i and
+to itself (`utils.teacher_forcing_mask`), each chunk with its own noise level,
+so every chunk trains the realtime condition. In a small test (1.6 h of audio,
+20M model, 3k steps, next-chunk loss on an unseen recording) it was best at
+every checkpoint on `preprocess --offsets 2` data (1.385 vs 1.422 for `joint`),
+but overfit without augmentation (1.469 vs 1.434): pair it with `--offsets`.
 
 ### Why Conditional Flow Matching?
 
@@ -50,34 +65,33 @@ continuation.
 | --- | --- |
 | `codec_wrapper.py` | MPS-safe wrapper around `codicodec.EncoderDecoder` (patches the upstream `mixed_precision` flag for non-CUDA devices, exposes encode/decode helpers). |
 | `config.py` | Dataclass-based config for model / CFM / data / training. |
-| `utils.py` | Device picker, block-causal mask builder, autocast context, logging, EMA. |
-| `data/preencode.py` | CLI: scans an audio directory, encodes with CoDiCodec, writes per-file `.pt` shards. |
-| `data/latent_dataset.py` | `LatentDataset`: random crops of `crop_tokens` from shards, train/val split. |
-| `model/dit.py` | `FlowDiT` block-causal transformer with AdaLN-Zero conditioning. |
-| `model/cfm.py` | CFM training loss, time/prefix samplers, Euler/Heun ODE samplers. |
-| `model/ema.py` | EMA of parameters with CPU shadow. |
+| `utils.py` | Device picker, attention masks (block-causal, teacher forcing), autocast context, logging. |
+| `data/preencode.py` | CLI: scans an audio directory, encodes with CoDiCodec, writes per-file `.pt` shards (optional offset / L-R augmentation). |
+| `data/latent_dataset.py` | `load_splits`: all shards in memory, random crops gathered on device, train/val split by source recording. |
+| `model/dit.py` | `FlowDiT` block-causal transformer with per-chunk AdaLN-Zero conditioning and K/V caching. |
+| `model/cfm.py` | Training losses (joint, teacher forcing), time samplers, solvers, joint and chunk-by-chunk sampling. |
+| `model/ema.py` | EMA of parameters on the model's device, with warmup. |
 | `train.py` | Training loop entry point. |
-| `sample.py` | Offline sampling entry point. |
-| `smoke_test.py` | Tiny end-to-end sanity check. |
+| `sample.py` | Offline sampling entry point (+ shared `load_model`). |
+| `realtime.py` | Live streaming generation with keyboard controls. |
+| `server.py` | stdio JSON backend wrapping `realtime` for an external GUI. |
+| `smoke_test.py` | Tiny end-to-end sanity check (incl. cache / teacher-forcing / encoding equivalence). |
 
 ## End-to-end usage
 
 ```bash
 # 0. Verify the wiring on your hardware (no codec download needed)
-python -m flow.smoke_test --device mps
+python -m flow.smoke_test
 
 # 1. Pre-encode a directory of audio
 python -m flow.data.preencode \
-    --in-dir   ~/datasets/loops \
-    --out-dir  ./data/latents   \
-    --device   mps              \
-    --max-seconds 60
+    --in-dir   ~/datasets/music \
+    --out-dir  ./data/latents
 
 # 2. Train (a few hundred K steps; logs every 50)
 python -m flow.train \
     --data-dir ./data/latents \
     --out-dir  ./runs/v0      \
-    --device   mps            \
     --batch-size 8 --max-steps 200000
 
 # 3a. Unconditional generation (no prompt)
@@ -85,8 +99,7 @@ python -m flow.sample \
     --ckpt        ./runs/v0/ema.pt \
     --duration-s  20               \
     --nfe         8 --solver heun  \
-    --out         ./out_uncond.wav \
-    --device      mps
+    --out         ./out_uncond.wav
 
 # 3b. Continuation of a 4s prompt (decoder same as 3a, just adds --prompt-wav)
 python -m flow.sample \
@@ -94,14 +107,12 @@ python -m flow.sample \
     --prompt-wav  ./prompt.wav     \
     --duration-s  20               \
     --nfe         8 --solver heun  \
-    --out         ./out_cont.wav   \
-    --device      mps
+    --out         ./out_cont.wav
 ```
 
-During training, periodic audio samples are **unconditional by default**.
-Override with `--audio-continuation` (re-enables prefix mode) or set
-`audio_unconditional: bool = False` in `config.py`. Toggle the volume of
-periodic sampling with `--audio-sample-every N` (0 disables).
+Periodic audio samples during training are off by default; enable them with
+`--audio-sample-every N`. They are unconditional unless you pass
+`--audio-continuation` (continue fixed validation clips).
 
 ## Tensor shape conventions
 
@@ -111,8 +122,9 @@ periodic sampling with `--audio-sample-every N` (0 disables).
   (0.683 s each at 48 kHz).
 - `x_data` for the model: `[B, L, 64]` with `L = crop_tokens` (must be a
   multiple of 8 = `block_size`).
-- `t_per_token` in CFM: `[B, L]` float in `[0, 1]`. Prefix tokens get
-  `t=0`, target tokens share the per-sample sampled `t`.
+- `t` for the model: `[B, L]` float in `[0, 1]`, constant within each chunk.
+  Clean context chunks get `t=0`; with teacher forcing each noisy chunk has
+  its own `t`.
 
 ## Defaults (and how to change them)
 
@@ -126,15 +138,16 @@ designed to fit on a 36 GB Apple Silicon machine with `batch_size=4`,
 | `n_layers` | 10 | transformer depth |
 | `n_heads` × `head_dim` | 12 × 64 | must equal `dim` |
 | `mlp_mult` | 4 | SwiGLU expansion |
-| `cond_dim` | 768 | per-token AdaLN-Zero modulation (≈37% of params) |
+| `cond_dim` | 768 | per-chunk AdaLN-Zero modulation (≈39% of params) |
 | `max_seq_len` | 1024 tokens | ≈ 87 s of audio |
-| `crop_tokens` | 768 | 96 chunks, ≈ 65 s of training context |
+| `crop_tokens` | 512 | 64 chunks, ≈ 44 s of training context |
+| `objective` | joint | or `teacher_forcing` |
 | `batch_size` × `grad_accum` | 8 × 2 | effective batch 16 (lower to 4×2 on MPS) |
 | `dtype` | bf16 | falls back to fp32 if MPS bf16 op unsupported |
 | `lr` | 1e-4 with 2k warmup | cosine to 0 over `max_steps` |
 | `ema_decay` | 0.9999 | applied after every optim step |
-| `p_unconditional` | 0.1 | random "no prefix" rate during training |
-| `prefix_min_frac` / `prefix_max_frac` | 0.05 / 0.75 | random prefix span |
+| `p_unconditional` | 0.1 | `joint` only: random "no prefix" rate |
+| `prefix_min_frac` / `prefix_max_frac` | 0.05 / 0.75 | `joint` only: random prefix span |
 
 Param breakdown (≈97M total): 10 × (attn 2.36M + SwiGLU 3.54M + AdaLN-mod 3.54M)
 = 94.4M in the transformer stack, plus 2.6M in input/output projections,
@@ -154,19 +167,15 @@ To train at the default ~100M scale on a 36 GB Mac:
 
 ```bash
 python -m flow.train --data-dir ./data/latents --out-dir ./runs/v0 \
-    --device mps --batch-size 4 --grad-accum 2 --crop-tokens 512 \
+    --batch-size 4 --grad-accum 2 --crop-tokens 512 \
     --dtype bf16 --max-steps 200000
 ```
 
 ## Known caveats & TODOs
 
-- **Streaming inference + KV cache** is not yet implemented (offline
-  sampling only). The block-causal mask is structured to make this a small
-  follow-up: cache K/V per chunk, denoise the next chunk over `n_steps`,
-  append, repeat.
-- **Classifier-free guidance** is not yet wired. The CFM training already
-  supports `p_unconditional` so the unconditional branch exists; a wrapper
-  in `sample()` to mix conditional/unconditional velocities is straightforward.
+- **Classifier-free guidance** is not wired. Chunk 0 of every crop is
+  trained without context, so a context-free branch exists; with the K/V
+  cache it costs only 8 extra tokens per solver step.
 - **Continuous control knobs** (density, brightness, etc.) require an extra
   conditioning vector in the AdaLN modulation. Out of scope for v0.
 - **MPS bf16 coverage** is improving but uneven. If a particular op blows

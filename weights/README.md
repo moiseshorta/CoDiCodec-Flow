@@ -1,5 +1,8 @@
 # FlowDiT weights: FSL10K + Suno songs (teacher forcing)
 
+> Not distributed with this repository: the checkpoint files below and the raw
+> `logs/*.log`. This card, `logs/diag.json` and `logs/study.py` are included.
+
 | File | What | Use |
 |---|---|---|
 | `ema.pt` (388 MB) | EMA weights, step 140000 | inference (`sample`, `realtime`, `server`) |

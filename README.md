@@ -32,8 +32,9 @@ sequence.
   realtime generates it (clean context → one noisy chunk, each chunk with its
   own noise level). Teacher forcing learns that condition much faster; on
   small datasets pair it with augmentation (`preprocess --offsets`).
-- Runs on CUDA and Apple Silicon (MPS); trains and runs in real time on a
-  36 GB Apple Silicon laptop.
+- Trains on NVIDIA GPUs (CUDA, Linux or Windows) and Apple Silicon (MPS);
+  trains and runs in real time on a 36 GB Apple Silicon laptop. Live playback
+  (`realtime`, `server`) needs macOS or Linux.
 
 ## Google Colab
 
@@ -69,6 +70,8 @@ codicodec-flow/
     realtime.py        live streaming generation
     server.py          stdio JSON backend for an external GUI
     smoke_test.py      end-to-end sanity check
+  weights/             model card + logs of the trained model (checkpoints not distributed)
+  AGENT_NOTES.md       every change vs. the original code, measurements, next steps
   requirements.txt
   README.md            (this file)
 ```
@@ -80,6 +83,9 @@ codicodec-flow/
 conda create -n codicodec-flow python=3.10
 conda activate codicodec-flow
 
+# Windows + NVIDIA only: install a CUDA build of PyTorch first; the default
+# pip wheel on Windows is CPU-only. See https://pytorch.org/get-started/locally/
+
 # Install dependencies
 pip install -r requirements.txt
 
@@ -89,7 +95,8 @@ pip install -e ./codicodec
 # Linux only, for realtime playback: the PortAudio library used by sounddevice
 sudo apt install libportaudio2
 
-# Verify the model and codec work on your machine (downloads the codec checkpoint on first run)
+# Verify the model and codec work on your machine; prints the device it picked
+# (downloads the codec checkpoint on first run)
 python -m flow.smoke_test --with-codec
 ```
 

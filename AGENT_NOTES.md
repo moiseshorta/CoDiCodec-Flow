@@ -665,3 +665,6 @@ recomputed; at step 140k of a longer schedule LR jumps back up).
 * `weights/logs/train_bs16.log` (phase 1a), `train_phase1b_bs128.log` (phase 1b),
   `train.log` (phase 2), `diag.json` (§4.4), `study.py` (diagnostic + branch tool).
 * `weights/README.md`: short model card.
+* Git repository (unlike this zip): `weights/*.pt` and `weights/logs/*.log` are not
+  committed (GitHub's 100 MB file limit, `*.log` ignore rule); the checkpoints are
+  kept private.

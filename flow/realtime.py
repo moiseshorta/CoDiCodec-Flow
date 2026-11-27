@@ -74,6 +74,7 @@ except ImportError:  # pragma: no cover
 from .codec_wrapper import CodecConfig, CodecWrapper
 from .model.cfm import SUPPORTED_SOLVERS, generate_chunk
 from .model.dit import FlowDiT
+from .lora import LoraBank
 from .sample import load_model
 from .utils import best_device, get_logger
 
@@ -205,6 +206,7 @@ class KeyboardController:
         "  q         - quit",
         "  1/2/3     - diffusion steps (4/8/16)",
         "  e/h       - solver (euler / heun)",
+        "  d         - codec decode steps 2 <-> 1 (1: ~40% less decode time)",
         "  +/-       - context chunks (+/- 4)",
         "  </>       - temperature (-/+ 0.1)",
         "  r         - reset to defaults (incl. summary controls)",
@@ -228,6 +230,9 @@ class KeyboardController:
         "  Y         - randomize channel scale (uniform, independent per dim)",
         "  u         - randomize BOTH channel scale & bias",
         "  U         - reset channel controls only (scale=1, bias=0)",
+        "  -- LoRA (--lora files) --",
+        "  l         - next LoRA (each alone, then the base model)",
+        "  k / K     - LoRA strength -/+ 0.25",
         "  ?         - show this help",
     ]
 
@@ -297,6 +302,7 @@ class KeyboardController:
             gen.n_steps = 4
             gen.solver = "euler"
             gen.temperature = 1.0
+            gen.codec.cfg.decode_steps = None
             gen.set_context_chunks(gen.default_context_chunks)
             gen.summary_scale = torch.ones(
                 gen.block_size, device=gen.device, dtype=torch.float32
@@ -362,6 +368,13 @@ class KeyboardController:
             gen.randomize_channel_both()
         elif key == "U":
             gen.reset_channel_control()
+        elif key == "d":
+            gen.codec.cfg.decode_steps = 1 if gen.codec.cfg.decode_steps != 1 else None
+            print(f"[KEY] codec decode steps = {gen.codec.cfg.decode_steps or 2}")
+        elif key == "l" and gen.lora:
+            gen.lora.cycle()
+        elif key in ("k", "K") and gen.lora:
+            gen.lora.nudge(0.25 if key == "K" else -0.25)
         elif key == "?":
             print()
             for line in self.HELP_LINES:
@@ -502,6 +515,7 @@ class RealtimeFlowGenerator:
     ):
         self.model = model
         self.codec = codec
+        self.lora: Optional[LoraBank] = None  # set when --lora files are given
         self.device = device
         self.dtype = next(model.parameters()).dtype
 
@@ -954,11 +968,35 @@ class RealtimeFlowGenerator:
         self.chunk_count += 1
         self.total_audio_samples += len(audio)
         self.total_compute_time += t_gen + t_dec
+        self._step_down_if_behind()
         # Periodically release accelerator cache to prevent fragmentation
         # over very long sessions.
         if self._cache_release_every > 0 and self.chunk_count % self._cache_release_every == 0:
             self._release_device_cache()
         return audio, t_gen, t_dec
+
+    def _step_down_if_behind(self) -> None:
+        """Slower than real time over the last 5+ chunks (heavy settings, or other apps
+        taking the CPU/GPU): switch to cheaper settings now rather than drop out later.
+        Order: sampler steps down to 8, codec decode steps 2 -> 1, then steps down to 1."""
+        recent = [g + d for g, d in zip(self.gen_times[-10:], self.decode_times[-10:])]
+        budget = self.samples_per_chunk / self.sample_rate
+        if len(recent) < 5 or sum(recent) / len(recent) < 0.9 * budget:
+            return
+        before = f"steps={self.n_steps} decode_steps={self.codec.cfg.decode_steps or 2}"
+        if self.n_steps > 8:
+            self.n_steps = max(8, self.n_steps // 2)
+        elif self.codec.cfg.decode_steps != 1:
+            self.codec.cfg.decode_steps = 1
+        elif self.n_steps > 1:
+            self.n_steps //= 2
+        else:
+            return  # nothing cheaper left
+        logger.warning("behind real time (%.0f ms per %.0f ms chunk): %s -> steps=%d decode_steps=%d",
+                       1e3 * sum(recent) / len(recent), 1e3 * budget, before, self.n_steps,
+                       self.codec.cfg.decode_steps or 2)
+        self.gen_times.clear()  # judge the new settings on fresh timings
+        self.decode_times.clear()
 
     def _release_device_cache(self) -> None:
         """Best-effort allocator cleanup. Safe no-op if the API is missing."""
@@ -1163,7 +1201,8 @@ class RealtimeFlowGenerator:
                         f"dec {t_dec*1000:5.0f}ms = {total_t*1000:5.0f}ms | "
                         f"audio {chunk_secs:.2f}s | RT {rt_speed:5.1f}% [{tag}] | "
                         f"buf {buf_s:4.1f}s | underruns {self.audio_buffer.underruns} | "
-                        f"steps={self.n_steps} solver={self.solver} ctx={self.context_chunks}ch "
+                        f"steps={self.n_steps} solver={self.solver} decode={self.codec.cfg.decode_steps or 2} "
+                        f"ctx={self.context_chunks}ch "
                         f"seed={self.current_seed} temp={self.temperature:.2f} "
                         f"sum={sum_marker} ch={ch_marker}"
                     )
@@ -1263,6 +1302,9 @@ def _build_argparser() -> argparse.ArgumentParser:
         epilog=__doc__,
     )
     p.add_argument("--ckpt", required=True, help="Path to last.pt or ema.pt produced by training.")
+    p.add_argument("--lora", nargs="+", default=None,
+                   help="LoRA files from `train --lora-base` (same base as --ckpt). Starts on the first; "
+                        "'l' switches.")
     p.add_argument("--use-ema", action="store_true",
                    help="Load EMA weights from the checkpoint (recommended for inference).")
 
@@ -1360,6 +1402,9 @@ def main() -> None:
             generator._fmt_summary_vec(generator.summary_bias),
         )
 
+    if args.lora:
+        generator.lora = LoraBank(model, args.lora)
+        generator.lora.cycle()  # first LoRA on
     generator.run(max_chunks=args.max_chunks, save_path=args.save)
 
 

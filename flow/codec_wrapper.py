@@ -79,6 +79,10 @@ class CodecWrapper:
         # are created with the right dtype expectations.
         if self.device.type != "cuda":
             _patch_codicodec_mixed_precision(False)
+            # fp32 encoder batches of the codec's default 64 chunks peak at ~10 GB on
+            # MPS; 8 chunks encode just as fast at ~3 GB (same latents).
+            if self.cfg.max_batch_encode is None:
+                self.cfg.max_batch_encode = 8
             logger.info("Disabled codicodec mixed_precision (running on %s)", self.device.type)
 
         # Defer import until we've patched the flag.
@@ -196,6 +200,7 @@ class CodecWrapper:
         chunk_latent = chunk_latent.detach().to(torch.float32)
         wv = self._encdec.decode_next(
             chunk_latent,
+            denoising_steps=self.cfg.decode_steps,  # None: the codec's default (2)
             preprocess_on_gpu=(self.device.type == "cuda"),
         )
         if isinstance(wv, torch.Tensor):

@@ -33,6 +33,7 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 
 from .config import Config, ModelConfig
 from .data.latent_dataset import LatentDataset, load_splits
+from .lora import add_lora, export
 from .model.cfm import (
     SUPPORTED_SOLVERS,
     cfm_loss,
@@ -44,6 +45,7 @@ from .model.cfm import (
 )
 from .model.dit import FlowDiT
 from .model.ema import EMA
+from .sample import load_model
 from .utils import (
     autocast_ctx,
     best_device,
@@ -102,6 +104,11 @@ def train(cfg: Config) -> None:
         raise ValueError(f"unknown objective: {cfg.cfm.objective!r}")
     logger.info("device=%s dtype=%s objective=%s", device, dtype, cfg.cfm.objective)
 
+    if cfg.train.lora_base:  # the frozen base fixes the architecture
+        base_sd = torch.load(cfg.train.lora_base, map_location="cpu", weights_only=True)
+        cfg.model = ModelConfig(**base_sd["config"]["model"])
+        del base_sd
+
     out_dir = ensure_dir(cfg.train.out_dir)
     L = cfg.data.crop_tokens
     block_size = cfg.model.block_size
@@ -116,7 +123,12 @@ def train(cfg: Config) -> None:
     # ------- model ------------------------------------------------------- #
     # Per-channel normalization (SD3 / Stable Audio 2) so the data matches the
     # N(0, I) noise at t=1; baked in as buffers so checkpoints are self-contained.
-    model = build_model(cfg.model, train_ds.mean, train_ds.std).to(device)
+    if cfg.train.lora_base:
+        # Base weights and latent stats stay as trained, so adapters swap live over one base.
+        model = load_model(cfg.train.lora_base, device)
+        add_lora(model, cfg.train.lora_rank)
+    else:
+        model = build_model(cfg.model, train_ds.mean, train_ds.std).to(device)
     n_params = count_params(model)
     logger.info("Model: %s params (%s)", n_params, human_int(n_params))
 
@@ -209,8 +221,15 @@ def train(cfg: Config) -> None:
     # Summed on device; read back only when logging (no per-step GPU sync).
     running_loss = torch.zeros((), device=device)
     running_n = 0
+    best_val = float("inf")
+    best_file = lora_file(out_dir, best=True)
+    if cfg.train.lora_base and start_step and best_file.exists():  # resuming: beat the earlier best
+        best_val = torch.load(str(best_file), weights_only=True).get("val_loss") or best_val
     # Lazy CodecWrapper holder; only built when audio sampling fires.
     codec_state: dict = {"codec": None}
+
+    if val_ds is not None and start_step == 0:  # baseline (the base model, for LoRA / fine-tune runs)
+        logger.info("[val] step=0  next_chunk_loss=%.4f", evaluate(model, val_ds, tf_mask, device, dtype))
 
     # Generate samples at step 0 so we hear what untrained model sounds like.
     if cfg.train.audio_sample_every > 0:
@@ -293,6 +312,9 @@ def train(cfg: Config) -> None:
                 val_loss = evaluate(model, val_ds, tf_mask, device, dtype)
                 logger.info("[val] step=%d  next_chunk_loss=%.4f", step + 1, val_loss)
                 model.train()
+                if cfg.train.lora_base and val_loss < best_val:  # adapters on small data overfit: keep the best
+                    best_val = val_loss
+                    save_lora(out_dir, ema, cfg, step + 1, val_loss, best=True)
 
             # Audio sampling
             if cfg.train.audio_sample_every > 0 and (step + 1) % cfg.train.audio_sample_every == 0:
@@ -307,6 +329,8 @@ def train(cfg: Config) -> None:
             # Checkpoint
             if (step + 1) % cfg.train.ckpt_every == 0 or (step + 1) == cfg.train.max_steps:
                 save_checkpoint(out_dir, model, optim, ema, cfg, step + 1)
+                if cfg.train.lora_base:
+                    save_lora(out_dir, ema, cfg, step + 1)
 
     logger.info("Training done.")
 
@@ -435,6 +459,9 @@ def save_checkpoint(out_dir: str, model, optim, ema: EMA, cfg: Config, step: int
         },
         last,
     )
+    if cfg.train.lora_base:  # no ema.pt: it would lack the frozen base weights (see save_lora)
+        logger.info("[ckpt] step=%d  -> %s", step, last.name)
+        return
     # Standalone EMA file for inference.
     ema_path = Path(out_dir) / "ema.pt"
     _atomic_save(
@@ -451,6 +478,21 @@ def save_checkpoint(out_dir: str, model, optim, ema: EMA, cfg: Config, step: int
     logger.info("[ckpt] step=%d  -> %s, %s", step, last.name, ema_path.name)
 
 
+def lora_file(out_dir: str, best: bool = False) -> Path:
+    """`<out_dir>/<out_dir name>.pt` (latest checkpoint) or `..._best.pt` (best validation)."""
+    return Path(out_dir) / f"{Path(out_dir).resolve().name}{'_best' if best else ''}.pt"
+
+
+def save_lora(out_dir: str, ema: EMA, cfg: Config, step: int, val_loss: Optional[float] = None,
+              best: bool = False) -> None:
+    """An adapter file: EMA of the LoRA factors (the only parameters the EMA tracks in a
+    LoRA run), scale folded in."""
+    path = lora_file(out_dir, best)
+    _atomic_save({"lora": export(ema.shadow), "base": cfg.train.lora_base, "step": step,
+                  "val_loss": val_loss}, path)
+    logger.info("[lora] step=%d  -> %s", step, path.name)
+
+
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
@@ -463,6 +505,10 @@ def _build_argparser() -> argparse.ArgumentParser:
                    help="Path to last.pt to initialize weights from (fine-tune). "
                         "Optimizer / step counter start fresh; lat_stats stay tied "
                         "to the new dataset. Ignored if out-dir/last.pt exists.")
+    p.add_argument("--lora-base", default=None,
+                   help="Train LoRA adapters on this frozen checkpoint (e.g. weights/ema.pt) "
+                        "instead of the full model; writes <out-dir>/<out-dir name>.pt.")
+    p.add_argument("--lora-rank", type=int, default=None, help="LoRA rank (default 16).")
     p.add_argument("--device", default=None, help="cuda | mps | cpu (default: auto)")
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--grad-accum", type=int, default=None)
@@ -519,6 +565,10 @@ def main() -> None:
         cfg.train.out_dir = args.out_dir
     if args.init_from:
         cfg.train.init_from = args.init_from
+    if args.lora_base:
+        cfg.train.lora_base = args.lora_base
+    if args.lora_rank:
+        cfg.train.lora_rank = args.lora_rank
     if args.device:
         cfg.device = args.device
     if args.batch_size:

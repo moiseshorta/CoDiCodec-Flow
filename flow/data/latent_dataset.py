@@ -10,7 +10,7 @@ Crops of `crop_tokens` (a multiple of 8) are drawn uniformly over every valid
 chunk-aligned start, so each second of audio is equally likely regardless of
 how it is split into files. The train/val split is by source recording, so
 augmented variants of one file (`preencode --offsets/--swap-lr`) never
-straddle it.
+straddle it; a dataset of one recording is split by time instead.
 """
 
 from __future__ import annotations
@@ -105,6 +105,13 @@ def load_splits(root, crop_tokens: int, val_frac: float = 0.05, seed: int = 42, 
         raise FileNotFoundError(f"No latent shards found under {root}")
 
     sources = sorted(by_source)
+    if len(sources) == 1 and val_frac > 0:
+        # One long recording (e.g. a DJ mix): hold out its last `val_frac` of time.
+        # Offset variants are cut at the same token index (< 1 chunk apart in time).
+        pieces = by_source[sources[0]]
+        cut = lambda p: int(p.shape[0] * (1 - val_frac)) // CODEC_TOKENS_PER_CHUNK * CODEC_TOKENS_PER_CHUNK
+        return (LatentDataset([p[: cut(p)] for p in pieces], crop_tokens, device, "train"),
+                LatentDataset([p[cut(p):] for p in pieces], crop_tokens, device, "val"))
     random.Random(seed).shuffle(sources)
     n_val = max(1, int(len(sources) * val_frac)) if val_frac > 0 else 0
     if n_val >= len(sources):

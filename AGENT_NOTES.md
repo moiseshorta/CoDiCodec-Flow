@@ -668,3 +668,84 @@ recomputed; at step 140k of a longer schedule LR jumps back up).
 * Git repository (unlike this zip): `weights/*.pt` and `weights/logs/*.log` are not
   committed (GitHub's 100 MB file limit, `*.log` ignore rule); the checkpoints are
   kept private.
+
+---
+
+## 11. LoRA adapters (added 2026-11-24, measured on an Apple M4 Max)
+
+**What changed**
+
+* `flow/lora.py` (new): `LoRALinear` (frozen base + B·A, B starts at 0), `add_lora`
+  (wraps `attn.qkv`, `attn.out`, `mlp.w1`, `mlp.w2` of every block: 1.72M params at
+  rank 16), `LoraBank` (live use: W = W_base + Σ sᵢ·Bᵢ·Aᵢ rebuilt in place; 1.9 ms per
+  switch on MPS, generation at base speed).
+* `train.py`: `--lora-base CKPT`, `--lora-rank`. Architecture, weights and latent stats
+  come from the base (so all adapters on one base are interchangeable); only adapters
+  train, so the optimizer and EMA see only them. Writes `<out_dir>/<out_dir name>.pt`
+  (EMA of A, B; 6.9 MB) instead of `ema.pt`. Every run now logs `[val] step=0` first.
+* `latent_dataset.py`: a dataset of one source recording is split by time (last
+  `val_frac`); it used to raise "Need at least 2 source recordings".
+* `realtime.py`: `--lora` files; keys `l` (each adapter alone, then base), `k`/`K`
+  (strength ∓0.25). `server.py`: `--lora`, `{"type":"set_lora","mix":{...}}` (blend),
+  `loras`/`lora_mix` in `ready`. `sample.py`: `--lora` (applied together at strength 1).
+* `sample.load_model`: a checkpoint without a `model` entry (ema.pt) loads its EMA
+  weights without `--use-ema`; the documented `realtime --ckpt weights/ema.pt` failed.
+* `codec_wrapper.py`: off CUDA the encoder runs 8 chunks per batch instead of the
+  codec's 64. 5-min file on MPS: peak 3.1 GB instead of 10.6 GB, same speed, same
+  latents (max diff 5e-6 in tanh space). The 3ball mix encoded before this fix peaked
+  at 17.8 GB.
+* `smoke_test.py`: LoRA merged live == LoRA training forward (rel err 2e-7); off == base.
+
+**3ball run** (`datasets/mix.wav`, one 45.7 min mix, 48 kHz): `preprocess --offsets 2`
+took 6.7 min; training with the README command ran 4000 steps at 1.94 steps/s (~35 min,
+6.5 GB peak).
+
+| step | 0 (base) | 250 | 500 | 1000 | 2000 | 3000 | 4000 |
+|---|---|---|---|---|---|---|---|
+| next_chunk_loss, held-out last 5 % | 1.0153 | 0.9318 | 0.9170 | 0.9065 | 0.8990 | 0.8989 | 0.8984 |
+
+Saved EMA adapter: 0.8983 at strength 1.0, 0.9221 at 0.5, 0.9764 at 1.5. Validation is
+flat after ~1750 steps and never rises: about half the steps would do.
+
+**Not verified:** listening quality (losses only); the held-out part is the end of the
+same mix, so it measures this mix's style, not 3ball in general; the server's
+`set_lora` command was not run (the `LoraBank` calls it makes were).
+
+**Rank 128 (same day).** Two changes first: `LoRALinear` scales its update by 4/√rank
+(rsLoRA), so one `--lr` works at any rank (scale 1.0 at rank 16: `3ball.pt` is unchanged),
+and the adapter file is now written only when validation improves (`train.save_lora`;
+`lora.export` folds the scale into B). Same command with `--lora-rank 128
+--out-dir runs/3ball_r128`: 13.76M adapter params, 1.75 steps/s, 55 MB file.
+
+| step | 250 | 500 | 750 | 1000 | 1250 | 1500 | 1750 | 2000 | 2250 | 2500 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| rank 128 | 0.9221 | 0.9036 | 0.8949 | 0.8902 | 0.8872 | **0.8865** | 0.8873 | 0.8889 | 0.8924 | 0.8944 |
+| rank 16 | 0.9318 | 0.9170 | 0.9108 | 0.9065 | 0.9050 | 0.9017 | 0.8993 | 0.8990 | 0.8978 | 0.9003 |
+
+Rank 128 beats rank 16's final loss by step 750, then overfits after step 1500 (train loss
+0.84 at step 2500, validation rising); stopped at ~2500 of 4000. Saved EMA adapter
+(step 1500): 0.8828 at strength 1.0, 0.8885 at 0.75, 0.8961 at 1.25 (rank 16: 0.8983;
+base: 1.0153). With 45 min of audio, more data is the next lever, not more rank or steps.
+
+**Rank 128 continued to 7500 steps** (resumed from step 2500 with `--max-steps 7500`, so the
+cosine schedule re-warmed the lr to 2.2e-4). Adapter files are now `<name>.pt` (latest
+checkpoint) and `<name>_best.pt` (best validation; kept across resumes via its stored
+`val_loss`). Validation rose at every check: 0.9024 (2750), 0.9371 (4000), 0.9586 (5000),
+0.9799 (7000–7500), while train loss fell to 0.694: memorization of the training part of
+the mix. Final adapter (step 7500): 0.9766 at strength 1.0, 0.9234 at 0.75, 0.9241 at 0.5;
+`_best` (step 1500) stays 0.8828. 0.83 steps/s in this run instead of 1.75: other GPU load
+on the machine (WindowServer ~100 % CPU).
+
+**Realtime underruns under load (same day).** A session at 16 Heun steps underran
+after ~230 chunks: gen 299 + decode 564 ms per 683 ms chunk. Cause: other apps, not
+state growth. The codec's streaming state is fixed-size and GPU memory stayed flat over
+300 chunks, but Pure Data was at ~900 % CPU plus OBS recording: the default settings
+went from 45 + 225 ms (18:45) to ~110 + 650–770 ms, drifting up ~20 % over 300 chunks
+(`kernel_task` busy: heat). No effect: torch threads 4, codec post-processing on the GPU,
+QoS user-interactive, fp16/bf16 autocast for the codec decoder. Codec decode steps 1
+instead of 2: 653 → 409 ms. Fix: `RealtimeFlowGenerator._step_down_if_behind` (runs in
+`_step`, so `server` gets it too; logs via `logger`, never stdout): when the last 5+
+chunks average > 90 % of the chunk duration it lowers sampler steps to 8, then codec
+decode steps to 1 (`CodecConfig.decode_steps` now reaches `decode_next_chunk`; key `d`
+toggles it, `r` restores it), then steps to 4/2/1. Under the same load, 16 Heun steps
+settled at 4 steps + decode 1: ~540 ms per chunk, no underruns.

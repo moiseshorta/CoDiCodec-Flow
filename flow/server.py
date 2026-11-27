@@ -32,6 +32,7 @@ Wire format (newline-delimited JSON, one object per line):
      "summary_scale":[...8],"summary_bias":[...8],
      "channel_scale":[...64],"channel_bias":[...64],
      "seed":12345,"seed_mode":"crossfade"}
+    {"type":"set_lora","mix":{"3ball":1.0}}                # blend --lora files; {} = base model
     {"type":"shutdown"}
 
   Events (Python -> Electron, stdout):
@@ -67,6 +68,7 @@ except Exception:  # pragma: no cover
     sd = None
 
 from .codec_wrapper import CodecConfig, CodecWrapper
+from .lora import LoraBank
 from .realtime import RealtimeFlowGenerator, load_model
 from .utils import best_device, get_logger
 
@@ -814,6 +816,12 @@ class ServerApp:
             else:
                 gen.crossfade_to_seed(seed)
             return
+        if t == "set_lora":
+            if gen.lora is None:
+                self._log("error", "no LoRAs loaded (start with --lora)")
+                return
+            gen.lora.set({str(k): float(v) for k, v in (cmd.get("mix") or {}).items()})
+            return
         if t == "set_lfo":
             name = cmd.get("name")
             if name not in self.lfos:
@@ -985,6 +993,8 @@ class ServerApp:
             "channel_bias_range": list(gen.channel_bias_range),
             "lfo_shapes": list(LFO_SHAPES),
             "lfo_names": list(LFO_NAMES),
+            "loras": list(gen.lora.loras) if gen.lora else [],
+            "lora_mix": dict(gen.lora.mix) if gen.lora else {},
             "params": {
                 "temperature": self._base_temperature,
                 "n_steps": self._base_n_steps,
@@ -1240,6 +1250,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument("--ckpt", required=True, help="Path to last.pt or ema.pt.")
     p.add_argument("--use-ema", action="store_true")
+    p.add_argument("--lora", nargs="+", default=None, help="LoRA files over --ckpt; starts on the first.")
     p.add_argument("--device", default=None, help="cuda | mps | cpu")
     p.add_argument("--output-device", default=None,
                    help="sounddevice output device (int index or name substring). "
@@ -1285,6 +1296,9 @@ def main() -> None:
         initial_seed=args.seed,
     )
 
+    if args.lora:
+        gen.lora = LoraBank(model, args.lora)
+        gen.lora.cycle()  # first LoRA on
     app = ServerApp(gen, max_chunks=args.max_chunks, save_path=args.save,
                     output_device=args.output_device)
     try:

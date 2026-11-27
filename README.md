@@ -66,6 +66,7 @@ codicodec-flow/
       cfm.py           training losses + samplers (joint, chunk by chunk)
       ema.py
     train.py           training loop
+    lora.py            LoRA adapters: training wrapper, live switching
     sample.py          offline sampling
     realtime.py        live streaming generation
     server.py          stdio JSON backend for an external GUI
@@ -388,6 +389,7 @@ time. Press `?` at any moment to print the up-to-date help in the terminal.
 | --- | --- |
 | `1` / `2` / `3` | Set diffusion steps to 4 / 8 / 16 NFE. |
 | `e` / `h` | Switch solver to `euler` / `heun`. |
+| `d` | Codec decode steps 2 ↔ 1 (1 cuts ~40 % of decode time; compare by ear). |
 | `<` / `>` | Decrease / increase temperature by 0.1. |
 | `+` / `-` | Increase / decrease context window by 4 chunks. |
 
@@ -421,6 +423,13 @@ time. Press `?` at any moment to print the up-to-date help in the terminal.
 | `u` | Randomize *both* channel scale and bias. |
 | `U` | Reset channel controls only. |
 
+**LoRA adapters** (with `--lora`, see [LoRA adapters](#lora-adapters))
+
+| Key | Action |
+| --- | --- |
+| `l` | Next adapter: each `--lora` file alone, then the base model, round robin. |
+| `k` / `K` | Decrease / increase adapter strength by 0.25. |
+
 ### How it works (at a glance)
 
 - The model generates one **codec chunk** per inference call. Each chunk is
@@ -443,8 +452,14 @@ time. Press `?` at any moment to print the up-to-date help in the terminal.
 
 ### Tips & troubleshooting
 
-- **Audio underruns / glitches**: lower `--nfe`, switch to `--solver euler`,
-  reduce `--context-chunks`, or increase `--prebuffer`.
+- **Audio underruns / glitches**: when the last 5+ chunks took over 90 % of their
+  playback time, the engine steps down by itself (logged as `behind real time`):
+  sampler steps to 8, then codec decode steps 2 → 1 (`d` toggles them), then steps
+  to 4, 2, 1. Most of each chunk's time is the codec decode (~225 ms per 683 ms
+  chunk on an idle M4 Max), and it slows 2–3× when other apps load the CPU/GPU
+  (measured with Pure Data at ~900 % CPU plus OBS recording); check Activity
+  Monitor if it starts underrunning mid-session. Raising the steps again (`1/2/3`)
+  is allowed; it steps down again if it can't keep up.
 - **Output sounds noisy or unstable**: try `--temperature 0.9` or lower, or
   use `--solver heun --nfe 8` for higher-quality steps.
 - **Engine quits immediately with "checkpoint not found"**: pass an absolute
@@ -454,6 +469,46 @@ time. Press `?` at any moment to print the up-to-date help in the terminal.
   default output in `System Settings > Sound`.
 - **"PortAudio library not found" (Linux)**: install it with
   `sudo apt install libportaudio2`.
+
+## LoRA adapters
+
+A LoRA adapter teaches the trained model a new style without retraining it: the
+base checkpoint stays frozen, and small low-rank updates on the attention and MLP
+projections of every block are trained instead (1.7M parameters and a 7 MB file at
+rank 16; 13.8M and 55 MB at rank 128). Adapters are independent files; `realtime` and `server` load any number of
+them over one base model and switch or blend them live.
+
+```bash
+# 1. Encode. Long files (a DJ mix) are read once and encoded 300 s at a time.
+python cli.py preprocess --in-dir ./datasets --out-dir ./data/3ball --offsets 2
+
+# 2. Train an adapter on the frozen base -> ./runs/3ball/3ball.pt (named after --out-dir)
+python cli.py train --lora-base weights/ema.pt --data-dir ./data/3ball --out-dir ./runs/3ball \
+    --objective teacher_forcing --crop-tokens 256 --batch-size 8 --grad-accum 1 \
+    --lr 3e-4 --warmup-steps 100 --max-steps 4000 --val-every 250 --ckpt-every 250
+
+# 3. Play: starts on the first adapter; 'l' switches, 'k'/'K' set the strength
+python cli.py realtime --ckpt weights/ema.pt --lora runs/3ball/3ball.pt other_style.pt
+```
+
+- Training on an Apple M4 Max: ~1.95 steps/s sustained with these settings (4000 steps
+  in ~35 min), ~6.5 GB peak memory.
+- `--lora-base` keeps the base's latent normalization, so every adapter trained on
+  the same base works with it.
+- `--lora-rank` sets the rank (default 16; more = more capacity, slower). Updates are
+  scaled by 4/√rank (rsLoRA), so the same `--lr` works at any rank.
+- `<name>.pt` is the adapter at the latest checkpoint; `<name>_best.pt` holds the step
+  with the best validation loss (small datasets overfit, so compare both by ear).
+  `last.pt` is the full training state: rerun the same command with a larger
+  `--max-steps` to continue.
+- Validation: data from one recording (a single mix) is split by time, the last
+  5 % held out. `[val] step=0` is the base model's loss on it, the number to beat.
+- A switch takes effect on the next chunk (~0.7 s) and continues from the current
+  context, so the music morphs instead of cutting. Adapters are merged into the
+  weights (W + strength x BA), so generation runs at base-model speed.
+- Server: start with `--lora ...`; `{"type":"set_lora","mix":{"3ball":1.0,"other_style":0.5}}`
+  blends several adapters, `{"mix":{}}` returns to the base model. The `ready` event
+  lists the loaded adapters (`loras`) and the active mix (`lora_mix`).
 
 ## Audio Examples
 

@@ -126,6 +126,11 @@ class TrainConfig:
     # from out_dir/last.pt takes precedence if it exists.
     init_from: Optional[str] = None
 
+    # LoRA: train adapters on this frozen checkpoint (ema.pt or last.pt) instead
+    # of a full model; see flow/lora.py.
+    lora_base: Optional[str] = None
+    lora_rank: int = 16
+
     batch_size: int = 8
     grad_accum: int = 2
     max_steps: int = 200_000

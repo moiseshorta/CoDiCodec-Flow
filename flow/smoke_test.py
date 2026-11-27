@@ -104,6 +104,24 @@ def smoke_model(device: torch.device) -> None:
     assert full.shape == (1, 5 * bs, D) and torch.isfinite(full).all()
     logger.info("joint sampling (heun) shape=%s", tuple(full.shape))
 
+    # LoRA: the training forward (LoRALinear wrappers) == weights merged live by LoraBank.
+    import copy, os, tempfile
+    from .lora import LoraBank, add_lora, export
+    tuned = copy.deepcopy(model)
+    add_lora(tuned, rank=4)  # rank 4: scale 2, so the export must fold it in
+    lora = {n: torch.nn.init.normal_(p, std=0.05).detach() for n, p in tuned.named_parameters() if p.requires_grad}
+    assert lora and all(n.endswith((".A", ".B")) for n in lora), "add_lora wrapped nothing"
+    path = os.path.join(tempfile.mkdtemp(), "smoke.pt")
+    torch.save({"lora": export(lora)}, path)
+    bank = LoraBank(model, [path])
+    t_tok = torch.rand(1, L, device=device)
+    with torch.no_grad():
+        v_base = model(x[:1], t_tok)
+        bank.set({"smoke": 1.0})
+        _close(model(x[:1], t_tok), tuned(x[:1], t_tok), "LoRA merged live == LoRA training forward")
+        bank.set({})
+        _close(model(x[:1], t_tok), v_base, "LoRA off == base model")
+
 
 def smoke_codec(device: torch.device) -> None:
     """Segmented encoding == whole-file encoding; decode round trip. Slow on first run."""

@@ -31,6 +31,7 @@ from .codec_wrapper import CodecConfig, CodecWrapper
 from .config import CODEC_CHUNK_SAMPLES, CODEC_SAMPLE_RATE, ModelConfig
 from .model.cfm import SUPPORTED_SCHEDULES, SUPPORTED_SOLVERS, generate, sample_joint
 from .model.dit import FlowDiT
+from .lora import LoraBank
 from .model.ema import EMA
 from .utils import best_device, get_logger
 
@@ -43,7 +44,7 @@ def load_model(ckpt_path: str, device: torch.device, use_ema: bool = True) -> Fl
     if "config" not in sd or "model" not in sd["config"]:
         raise RuntimeError(f"checkpoint {ckpt_path} has no 'config.model' field; cannot rebuild architecture")
     model = FlowDiT(**{**asdict(ModelConfig(**sd["config"]["model"])), "dropout": 0.0})
-    if use_ema:
+    if use_ema or "model" not in sd:  # ema.pt holds only EMA weights: no --use-ema needed
         if sd.get("ema") is None:
             raise RuntimeError(f"checkpoint {ckpt_path} has no 'ema' field")
         ema = EMA(model, decay=0.0)  # decay value doesn't matter for loading
@@ -62,6 +63,7 @@ def load_model(ckpt_path: str, device: torch.device, use_ema: bool = True) -> Fl
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--ckpt", required=True, help="Path to ema.pt produced by training.")
+    p.add_argument("--lora", nargs="+", default=None, help="LoRA files over --ckpt, applied together at strength 1.")
     p.add_argument("--prompt-wav", default=None, help="Optional prompt audio (any sr, stereo or mono).")
     p.add_argument("--duration-s", type=float, default=20.0,
                    help="Duration of the *generated continuation* in seconds (excludes prompt).")
@@ -95,6 +97,9 @@ def main() -> None:
 
     # Load model + codec.
     model = load_model(args.ckpt, device)
+    if args.lora:
+        bank = LoraBank(model, args.lora)
+        bank.set({name: 1.0 for name in bank.loras})
     codec = CodecWrapper(CodecConfig(device=str(device), decode_mode=args.decode_mode))
 
     # Encode the prompt (optional).
